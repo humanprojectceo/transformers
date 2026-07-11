@@ -54,6 +54,12 @@ class HumanVConfig(PreTrainedConfig):
         pad_token_id: Optional[int] = 50256,
         bos_token_id: Optional[int] = 50256,
         eos_token_id: Optional[int] = 50256,
+        
+        # --- Sparse MoE Configuration Knobs ---
+        num_experts: Optional[int] = 8,
+        num_experts_per_tok: Optional[int] = 2,
+        router_aux_loss_coef: Optional[float] = 0.01,
+        mlp_types: Optional[list[str]] = None,
         **kwargs,
     ):
         self.vocab_size = int(vocab_size)
@@ -128,6 +134,26 @@ class HumanVConfig(PreTrainedConfig):
         self.sparse_global_num_blocks = int(sparse_global_num_blocks)
         self.sparse_global_block_stride = int(sparse_global_block_stride)
         self.sparse_attention_window = int(sparse_attention_window)
+
+        # --- Initialize and validate MoE parameters ---
+        self.num_experts = int(num_experts)
+        self.num_experts_per_tok = int(num_experts_per_tok)
+        self.router_aux_loss_coef = float(router_aux_loss_coef)
+
+        self.mlp_types = mlp_types
+        if self.mlp_types is None:
+            # Default to an all-dense architecture to maintain backward compatibility
+            self.mlp_types = ["dense"] * self.num_hidden_layers
+        else:
+            # Check length matches depth
+            if len(self.mlp_types) != self.num_hidden_layers:
+                raise ValueError(
+                    f"The length of mlp_types ({len(self.mlp_types)}) must match num_hidden_layers ({self.num_hidden_layers})"
+                )
+            # Check correct layer types
+            for m_type in self.mlp_types:
+                if m_type not in ("dense", "moe"):
+                    raise ValueError(f"mlp_types can only contain 'dense' or 'moe', got {m_type}")
 
         super().__init__(
             tie_word_embeddings=bool(tie_word_embeddings),
