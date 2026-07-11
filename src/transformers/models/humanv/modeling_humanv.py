@@ -43,7 +43,31 @@ from .configuration_humanv import HumanVConfig
 
 logger = logging.get_logger(__name__)
 
-_NEG_INF = -1e9
+
+# -----------------------------------------------------------------------------
+# Precision-Safe Negative Infinity (Dynamic Masking to Prevent Overflow)
+# -----------------------------------------------------------------------------
+def _get_neg_inf(dtype: torch.dtype) -> float:
+    """
+    Computes a dynamically scaled negative infinity fallback value based on the tensor's precision.
+    
+    Why this is required:
+    Standard attention masks often hardcode negative infinity to a large value like -1e9.
+    While this works perfectly in float32, it triggers severe numeric overflow and runtime 
+    crashes in half-precision (float16/c10::Half), which has a maximum representable range of 
+    [-65504, 65504].
+    
+    To guarantee mathematical stability across diverse model-parallel deployments, mixed precision 
+    (AMP), and diverse hardware cards (such as Nvidia T4, A100, etc.), we dynamically scale this 
+    masking constant:
+    - For float16/half precision: we return -30000.0, which acts as a mathematical negative 
+      infinity (e^-30000 safely resolves to exactly 0.0 in softmax weights) without causing 
+      addition overflow when scores are accumulated.
+    - For other precisions (float32, bfloat16): we fall back to a standard large negative -1e9.
+    """
+    if dtype in (torch.float16, torch.half):
+        return -30000.0
+    return -1e9
 
 
 # -----------------------------------------------------------------------------
@@ -182,6 +206,16 @@ class HumanVMLP(nn.Module):
 # Sparse MoE Block
 # -----------------------------------------------------------------------------
 class HumanVMoeBlock(nn.Module):
+    """
+    A Sparse Mixture of Experts (MoE) block implementing standard Top-K Gating.
+    
+    Mathematical Formulation:
+    1. A gating network projects the hidden representations into a routing probability vector:
+       G(x) = Softmax(W_g * x)
+    2. The top-K highest values of G(x) are kept, and re-normalized so they sum to 1.0.
+    3. The tokens are routed to the selected expert MLPs, and their outputs are combined 
+       weighted by their re-normalized routing probabilities.
+    """
     def __init__(self, config: HumanVConfig):
         super().__init__()
         self.hidden_size = int(getattr(config, "hidden_size"))
@@ -233,6 +267,12 @@ class HumanVMoeBlock(nn.Module):
 
 # Helper function to compute Auxiliary Load Balancing Loss
 def load_balancing_loss(router_logits_list: list[torch.Tensor], num_experts: int, top_k: int) -> torch.Tensor:
+    """
+    Computes the load balancing auxiliary loss (GShard style) to prevent expert collapse.
+    
+    The loss enforces a uniform distribution over the routed experts by penalizing concentration 
+    of routing probabilities and allocation frequencies.
+    """
     if not router_logits_list:
         return torch.tensor(0.0)
 
@@ -471,6 +511,9 @@ class HumanVAttention(nn.Module):
         if h != self.num_heads:
             raise ValueError(f"Expected q heads={self.num_heads}, got {h}")
 
+        # Dynamic, precision-safe masking value fallback
+        neg_inf = _get_neg_inf(q.dtype)
+
         seqlen = k.shape[-2]
         orig_q_len = q_len
         orig_seqlen = seqlen
@@ -550,7 +593,7 @@ class HumanVAttention(nn.Module):
 
             kv_mask_sel = key_valid_blocks[:, idx_c].reshape(bsz, clen, max_sel * b)
             kv_mask_sel = kv_mask_sel * idxv_c[None, :, :].to(kv_mask_sel.dtype)
-            scores = scores + (1.0 - kv_mask_sel)[:, None, None, :, None, :] * _NEG_INF
+            scores = scores + (1.0 - kv_mask_sel)[:, None, None, :, None, :] * neg_inf
 
             causal_mask = torch.zeros((clen, b, max_sel * b), device=q.device, dtype=torch.bool)
             active = selfpos_c >= 0
@@ -563,7 +606,7 @@ class HumanVAttention(nn.Module):
                         continue
                     causal_mask[:, :, s * b : (s + 1) * b] |= (onehot[:, s][:, None, None] & intra[None, :, :])
 
-            scores = scores.masked_fill(causal_mask[None, None, None, :, :, :], _NEG_INF)
+            scores = scores.masked_fill(causal_mask[None, None, None, :, :, :], neg_inf)
 
             if self.sparse_attention_window > 0:
                 max_ctx = int(self.sparse_attention_window)
@@ -579,7 +622,7 @@ class HumanVAttention(nn.Module):
 
                 final_mask = window_mask & (~is_global_token)
 
-                scores = scores.masked_fill(final_mask[None, None, None, :, :, :], _NEG_INF)
+                scores = scores.masked_fill(final_mask[None, None, None, :, :, :], neg_inf)
 
             probs = torch.softmax(scores, dim=-1)
             probs = F.dropout(probs, p=self.attention_dropout, training=self.training)
@@ -603,6 +646,9 @@ class HumanVAttention(nn.Module):
             raise ValueError("decode_one expects q_len == 1")
         if h != self.num_heads:
             raise ValueError(f"Expected q heads={self.num_heads}, got {h}")
+
+        # Dynamic, precision-safe masking value fallback
+        neg_inf = _get_neg_inf(q.dtype)
 
         seqlen = k.shape[-2]
         orig_seqlen = seqlen
@@ -667,14 +713,14 @@ class HumanVAttention(nn.Module):
         kv_mask_sel = key_valid_blocks[:, idx_row].reshape(bsz, S)
         idxv_tok = idxv_row[:, None].expand(max_sel, b).reshape(S).to(kv_mask_sel.dtype)
         kv_mask_sel = kv_mask_sel * idxv_tok[None, :]
-        scores = scores + (1.0 - kv_mask_sel)[:, None, None, None, :] * _NEG_INF
+        scores = scores + (1.0 - kv_mask_sel)[:, None, None, None, :] * neg_inf
 
         self_p = int(self_pos[q_block].item())
         if self_p >= 0:
             s = self_p * b
             e = s + b
             mask = torch.arange(b, device=q.device) > q_intra
-            scores[..., s:e] = scores[..., s:e].masked_fill(mask[None, None, None, None, :], _NEG_INF)
+            scores[..., s:e] = scores[..., s:e].masked_fill(mask[None, None, None, None, :], neg_inf)
 
         if self.sparse_attention_window > 0:
             max_ctx = int(self.sparse_attention_window)
@@ -689,7 +735,7 @@ class HumanVAttention(nn.Module):
 
             final_mask = window_mask & (~is_global_token)
 
-            scores = scores.masked_fill(final_mask[None, None, None, None, :], _NEG_INF)
+            scores = scores.masked_fill(final_mask[None, None, None, None, :], neg_inf)
 
         probs = torch.softmax(scores, dim=-1)
         probs = F.dropout(probs, p=self.attention_dropout, training=self.training)
@@ -893,8 +939,12 @@ class HumanVModel(HumanVPreTrainedModel):
         m = self._causal_cache.get(key)
         if m is not None:
             return m
+        
+        # Dynamic, precision-safe negative infinity fallback
+        neg_inf = _get_neg_inf(dtype)
+        
         m = torch.triu(
-            torch.full((q_len, src_len), _NEG_INF, device=device, dtype=dtype),
+            torch.full((q_len, src_len), neg_inf, device=device, dtype=dtype),
             diagonal=1 + past_len,
         )
         m = m[None, None, :, :]
@@ -908,7 +958,11 @@ class HumanVModel(HumanVPreTrainedModel):
         causal = self._get_causal_mask(q_len=q_len, src_len=src_len, past_len=past_len, device=device, dtype=dtype)
 
         key_valid = attention_mask_2d.to(dtype=torch.bool)
-        pad_bias = (~key_valid)[:, None, None, :].to(dtype=dtype) * torch.tensor(_NEG_INF, device=device, dtype=dtype)
+        
+        # Dynamic, precision-safe negative infinity fallback
+        neg_inf = _get_neg_inf(dtype)
+        
+        pad_bias = (~key_valid)[:, None, None, :].to(dtype=dtype) * neg_inf
         return causal + pad_bias
 
     def forward(
