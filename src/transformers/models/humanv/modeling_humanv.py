@@ -112,7 +112,8 @@ class HumanVPagedCache(Cache):
     Guarantees fixed physical shapes during execution to prevent TorchInductor recompilations.
     """
     def __init__(self, config: HumanVConfig, max_batch_size: int, num_pages: int, page_size: int, device: torch.device, dtype: torch.dtype = torch.bfloat16):
-        super().__init__()
+        # Satisfy Transformers parent validation (provide exactly one of layers or layer_class_to_replicate)
+        super().__init__(layer_class_to_replicate=object)
         
         self.num_pages = num_pages
         self.page_size = page_size
@@ -181,19 +182,18 @@ class HumanVPagedCache(Cache):
         physical_pages = self.page_table[batch_indices, logical_pages]
         physical_indices = physical_pages * self.page_size + offsets
         
-        # 3. View-transpose self.k_cache and self.v_cache for advanced indexing compatibility
+        # 3. Direct gather using indexing without transposing entire cache
         k_cache_trans = self.k_cache[layer_idx][0].transpose(0, 1)  # (S, num_kv_heads, head_dim)
         v_cache_trans = self.v_cache[layer_idx][0].transpose(0, 1)  # (S, num_kv_heads, head_dim)
         
-        # 4. Gather pages
         k_gathered = k_cache_trans[physical_indices]  # (bsz, kv_seq_len, num_kv_heads, head_dim)
         v_gathered = v_cache_trans[physical_indices]
         
-        # 5. Permute back to standard HF format: (bsz, num_kv_heads, kv_seq_len, head_dim)
+        # 4. Permute back to standard HF format: (bsz, num_kv_heads, kv_seq_len, head_dim)
         k_gathered = k_gathered.permute(0, 2, 1, 3)
         v_gathered = v_gathered.permute(0, 2, 1, 3)
         
-        # 6. Apply masking for unallocated entries
+        # 5. Apply masking for unallocated entries
         valid_mask = (physical_pages >= 0).unsqueeze(1).unsqueeze(-1)  # (bsz, 1, kv_seq_len, 1)
         k_gathered = k_gathered * valid_mask
         v_gathered = v_gathered * valid_mask
@@ -229,15 +229,9 @@ class HumanVPagedCache(Cache):
             physical_pages = self.page_table[b, logical_pages]
             physical_indices = physical_pages * self.page_size + offsets
             
-            # Using view-transpose assignment to bypass advanced indexing layout issues
-            k_layer = self.k_cache[layer_idx][0].transpose(0, 1)  # (S, num_kv_heads, head_dim)
-            v_layer = self.v_cache[layer_idx][0].transpose(0, 1)  # (S, num_kv_heads, head_dim)
-            
-            k_layer[physical_indices] = key_states[b].transpose(0, 1)
-            v_layer[physical_indices] = value_states[b].transpose(0, 1)
-            
-            self.k_cache[layer_idx][0] = k_layer.transpose(0, 1)
-            self.v_cache[layer_idx][0] = v_layer.transpose(0, 1)
+            # Pure in-place advanced indexing for contiguous memory writes (highly compile-friendly)
+            self.k_cache[layer_idx][0, :, physical_indices, :] = key_states[b].transpose(0, 1).to(dtype=self.k_cache[layer_idx].dtype)
+            self.v_cache[layer_idx][0, :, physical_indices, :] = value_states[b].transpose(0, 1).to(dtype=self.v_cache[layer_idx].dtype)
             
             if is_first_layer:
                 self.seq_lengths[b] += q_len
@@ -592,7 +586,6 @@ class HumanVAttention(nn.Module):
             k = self._kv_dtype(k)
             v = self._kv_dtype(v)
             cache_kwargs = {"cache_position": cache_position} if cache_position is not None else None
-            # Update cache and gather logically contiguous outputs
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
         k_len = k.shape[-2]
