@@ -22,6 +22,7 @@ Key fixes and features included:
 - Integrated PyTorch FlexAttention for custom sliding window attention masks.
 - Enabled compatibility with HF StaticCache and graph-friendly compilation (no dict caches).
 - Optimized VRAM retention via Inline Allocation of Auxiliary Losses.
+- Hardware-agnostic fallback to dense attention if FlexAttention is not supported.
 """
 
 from __future__ import annotations
@@ -35,8 +36,12 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 
-# PyTorch FlexAttention imports (PyTorch 2.5+)
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+# Safe import for PyTorch FlexAttention (PyTorch 2.5+)
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    HAS_FLEX = True
+except ImportError:
+    HAS_FLEX = False
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -92,7 +97,6 @@ def _sparse_mask_fn(
         valid = valid & (within_window | is_global)
 
     if padding_mask is not None:
-        # Check active non-padded tokens in batch element b at key position kv_idx
         return valid & padding_mask[b, kv_idx]
 
     return valid
@@ -443,7 +447,6 @@ class HumanVAttention(nn.Module):
         if past_key_values is not None:
             k = self._kv_dtype(k)
             v = self._kv_dtype(v)
-            # Pass cache_position parameters dynamically for StaticCache (Bottleneck 8)
             cache_kwargs = {"cache_position": cache_position} if cache_position is not None else None
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
@@ -455,43 +458,55 @@ class HumanVAttention(nn.Module):
             and self.sparse_attention_impl == "local_global_block"
         )
 
-        if use_sparse:
-            # 1. BroadCast KV heads to align GQA within FlexAttention
-            k = self._repeat_kv(k, self.num_kv_groups)
-            v = self._repeat_kv(v, self.num_kv_groups)
+        # Check if FlexAttention is supported on current GPU/Triton capability (Graceful Fallback)
+        has_flex_support = HAS_FLEX and q.is_cuda
 
-            # 2. Setup Boolean Padding mask for FlexAttention
-            pad_mask = attention_mask_2d.to(dtype=torch.bool) if attention_mask_2d is not None else None
-
-            # 3. Create logical mask on-the-fly and compile via Triton (Bottleneck 2)
-            mask_mod = partial(
-                _sparse_mask_fn,
-                block_size=self.sparse_block_size,
-                local_blocks=self.sparse_local_num_blocks,
-                global_blocks=self.sparse_global_num_blocks,
-                window_size=self.sparse_attention_window,
-                padding_mask=pad_mask,
-            )
-
-            block_mask = create_block_mask(
-                mask_mod,
-                B=bsz,
-                H=None,  # Broadcast mask across heads
-                Q_LEN=q_len,
-                KV_LEN=k_len,
-                device=q.device,
-                _compile=True,  # JIT pre-compilation
-            )
-
-            # 4. Execute fused FlexAttention
-            attn_out = flex_attention(q, k, v, block_mask=block_mask)
-        else:
-            if self.attn_backend == "sdpa":
+        if use_sparse and has_flex_support:
+            try:
+                # 1. BroadCast KV heads to align GQA within FlexAttention
                 k = self._repeat_kv(k, self.num_kv_groups)
                 v = self._repeat_kv(v, self.num_kv_groups)
-                attn_out = self._sdpa_mha_attention(q, k, v, attention_mask_4d)
-            else:
+
+                # 2. Setup Boolean Padding mask for FlexAttention
+                pad_mask = attention_mask_2d.to(dtype=torch.bool) if attention_mask_2d is not None else None
+
+                # 3. Create logical mask on-the-fly and compile via Triton (Bottleneck 2)
+                mask_mod = partial(
+                    _sparse_mask_fn,
+                    block_size=self.sparse_block_size,
+                    local_blocks=self.sparse_local_num_blocks,
+                    global_blocks=self.sparse_global_num_blocks,
+                    window_size=self.sparse_attention_window,
+                    padding_mask=pad_mask,
+                )
+
+                block_mask = create_block_mask(
+                    mask_mod,
+                    B=bsz,
+                    H=None,  # Broadcast mask across heads
+                    Q_LEN=q_len,
+                    KV_LEN=k_len,
+                    device=q.device,
+                    _compile=True,  # JIT pre-compilation
+                )
+
+                # 4. Execute fused FlexAttention
+                attn_out = flex_attention(q, k, v, block_mask=block_mask)
+            except Exception as e:
+                # Fallback to standard 4D attention if Triton compilation fails on specific GPUs
+                logger.warning_once(f"FlexAttention compilation fell back to Dense GQA. Reason: {e}")
                 attn_out = self._grouped_dense_attention(q, k, v, attention_mask_4d)
+        else:
+            # CPU or Non-Triton GPUs fall back to highly optimized dense 4D attention
+            if use_sparse:
+                attn_out = self._grouped_dense_attention(q, k, v, attention_mask_4d)
+            else:
+                if self.attn_backend == "sdpa":
+                    k = self._repeat_kv(k, self.num_kv_groups)
+                    v = self._repeat_kv(v, self.num_kv_groups)
+                    attn_out = self._sdpa_mha_attention(q, k, v, attention_mask_4d)
+                else:
+                    attn_out = self._grouped_dense_attention(q, k, v, attention_mask_4d)
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, q_len, self.num_heads * self.head_dim)
         attn_out = self.o_proj(attn_out)
@@ -693,16 +708,14 @@ class HumanVModel(HumanVPreTrainedModel):
         # Retrieve cache_position from generation kwargs (Bottleneck 8)
         cache_position = kwargs.get("cache_position", None)
 
-        # Optimization: Standard LLaMA practice for cache length evaluation (Stateless & compile-friendly)
-        if cache_position is not None:
-            past_len = cache_position[0]
-        else:
-            past_len = past_key_values.get_seq_length() if (past_key_values is not None and use_cache) else 0
+        # Optimization: Standard HF practice for cache length evaluation (Stateless & compile-friendly)
+        past_len = past_key_values.get_seq_length() if (past_key_values is not None and use_cache) else 0
 
         # Dynamic KV length tracking matching pre-allocated static/dynamic buffers (Bottleneck 8)
         if use_cache and past_key_values is not None:
-            max_cache_len = getattr(past_key_values, "get_max_length", lambda: -1)()
-            if max_cache_len > 0:
+            # Compat: Accessing the attribute 'max_cache_len' directly supporting HF 4.45+ and v5.0 (get_max_length is removed in v5)
+            max_cache_len = getattr(past_key_values, "max_cache_len", -1)
+            if max_cache_len is not None and max_cache_len > 0:
                 kv_seq_len = max_cache_len
             else:
                 kv_seq_len = past_len + q_len
@@ -719,9 +732,11 @@ class HumanVModel(HumanVPreTrainedModel):
             attention_mask_2d = attention_mask.to(device=inputs_embeds.device, dtype=torch.bool)
             if attention_mask_2d.shape[1] < kv_seq_len:
                 pad_len = kv_seq_len - attention_mask_2d.shape[1]
-                attention_mask_2d = F.pad(attention_mask_2d, (0, pad_len), value=False)
+                pad_tensor = torch.zeros((bsz, pad_len), device=inputs_embeds.device, dtype=torch.bool)
+                attention_mask_2d = torch.cat([attention_mask_2d, pad_tensor], dim=-1)
 
-        position_ids = torch.arange(past_len, past_len + q_len, device=inputs_embeds.device, dtype=torch.long)
+        # Compile-Safe Position IDs generation replacing nested arange gpu tensors (Bottleneck 13)
+        position_ids = torch.arange(q_len, dtype=torch.long, device=inputs_embeds.device) + past_len
         position_ids = position_ids.unsqueeze(0).expand(bsz, -1)
 
         cos, sin = self.rotary_emb(inputs_embeds, position_ids)
