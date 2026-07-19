@@ -939,11 +939,20 @@ class HumanVModel(HumanVPreTrainedModel):
         if use_cache is None:
             use_cache = bool(getattr(self.config, "use_cache", True))
 
+        # Safeguard: Forcefully disable `use_cache` during reentrant/non-reentrant checkpointed training to prevent size duplication
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning(
+                    "Gradient checkpointing is enabled, but `use_cache` is set to `True`. "
+                    "This is not supported during training and `use_cache` will be set to `False`."
+                )
+                use_cache = False
+
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
 
         bsz, q_len = inputs_embeds.shape[:2]
-        past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
+        past_len = past_key_values.get_seq_length() if (past_key_values is not None and use_cache) else 0
 
         if attention_mask is None:
             attention_mask_2d = torch.ones((bsz, past_len + q_len), device=inputs_embeds.device, dtype=torch.bool)
@@ -981,7 +990,7 @@ class HumanVModel(HumanVPreTrainedModel):
                     attention_mask_4d,
                     attention_mask_2d,
                     position_embeddings,
-                    past_key_values,
+                    past_key_values if use_cache else None, # Pass None to fully isolate states
                     output_attentions,
                     use_reentrant=False,
                 )
@@ -996,7 +1005,7 @@ class HumanVModel(HumanVPreTrainedModel):
                     attention_mask_4d=attention_mask_4d,
                     attention_mask_2d=attention_mask_2d,
                     position_embeddings=position_embeddings,
-                    past_key_values=past_key_values,
+                    past_key_values=past_key_values if use_cache else None,
                     output_attentions=output_attentions,
                 )
 
