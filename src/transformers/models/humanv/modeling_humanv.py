@@ -186,7 +186,7 @@ class HumanVPagedCache(Cache):
         self.physical_to_logical[batch_idx, physical_page_idx] = logical_page_idx
         return physical_page_idx
 
-    def gather_contiguous(self, layer_idx: int, kv_seq_len: int, bsz: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def gather_contiguous(self, layer_idx: int, kv_seq_len: int | torch.Tensor, bsz: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Gathers scattered physical pages on GPU memory into a logical contiguous representation.
         Completely vectorized and fully compile-friendly.
@@ -237,24 +237,28 @@ class HumanVPagedCache(Cache):
         
         is_first_layer = (layer_idx == 0)
         
-        # Vectorized logical page mapping directly on GPU
+        # Vectorized logical page mapping directly on GPU (Pure Tensor Arithmetic, Compile-Friendly)
         for b in range(bsz):
-            start_len = int(self.seq_lengths[b].item())
-            logical_positions = torch.arange(start_len, start_len + q_len, device=device)
+            start_len = self.seq_lengths[b]
+            logical_positions = torch.arange(q_len, device=device) + start_len
             logical_pages = logical_positions // self.page_size
             offsets = logical_positions % self.page_size
             
             if is_first_layer:
-                unique_pages = torch.unique(logical_pages)
-                for lp in unique_pages:
-                    lp_idx = int(lp.item())
-                    if self.page_table[b, lp_idx] == -1:
-                        self.allocate_page(b, lp_idx)
+                if torch.compiler.is_compiling():
+                    # During JIT compilation, we assume pages have been pre-allocated to bypass stateful CPU operations
+                    pass
+                else:
+                    unique_pages = torch.unique(logical_pages)
+                    for lp in unique_pages:
+                        lp_idx = int(lp.item())
+                        if self.page_table[b, lp_idx] == -1:
+                            self.allocate_page(b, lp_idx)
             
             physical_pages = self.page_table[b, logical_pages]
             physical_indices = physical_pages * self.page_size + offsets
             
-            # Direct in-place assignment matching PyTorch advanced indexing. 
+            # Direct in-place assignment aligned with PyTorch advanced indexing. 
             # No transpose needed on RHS since the indexing slice retains the default dimension layout.
             self.k_cache[layer_idx][0, :, physical_indices, :] = key_states[b].to(dtype=self.k_cache[layer_idx].dtype)
             self.v_cache[layer_idx][0, :, physical_indices, :] = value_states[b].to(dtype=self.v_cache[layer_idx].dtype)
@@ -262,10 +266,16 @@ class HumanVPagedCache(Cache):
             if is_first_layer:
                 self.seq_lengths[b] += q_len
                 
-        kv_seq_len = int(self.seq_lengths.max().item())
+        kv_seq_len = self.seq_lengths.max() if torch.compiler.is_compiling() else int(self.seq_lengths.max().item())
         return self.gather_contiguous(layer_idx, kv_seq_len, bsz)
 
-    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int | torch.Tensor:
+        """
+        Returns the sequence length of the cached states. Returns a Tensor when compiling to avoid graph breaks.
+        """
+        if torch.compiler.is_compiling():
+            # Keep get_seq_length symbolic on GPU during compilation, completely avoiding host-sync graph breaks
+            return self.seq_lengths.max()
         return int(self.seq_lengths.max().item())
 
 
@@ -522,6 +532,15 @@ class HumanVAttention(nn.Module):
         if self.attn_backend not in ("gqa_matmul", "sdpa"):
             self.attn_backend = "gqa_matmul"
 
+        # Pre-compile the flex_attention function to optimize eager-mode calls
+        if HAS_FLEX:
+            try:
+                self.flex_attention_compiled = torch.compile(flex_attention, dynamic=True)
+            except Exception:
+                self.flex_attention_compiled = flex_attention
+        else:
+            self.flex_attention_compiled = None
+
     def _kv_dtype(self, x: torch.Tensor) -> torch.Tensor:
         """Casts incoming key/value tensor states to specified precision formats."""
         if self.kv_cache_dtype == "auto":
@@ -670,8 +689,14 @@ class HumanVAttention(nn.Module):
                     _compile=True,  # JIT pre-compilation
                 )
 
-                # Execute fused FlexAttention
-                attn_out = flex_attention(q, k, v, block_mask=block_mask)
+                # 2. Select execution kernel depending on compilation environment
+                if torch.compiler.is_compiling():
+                    # The whole forward pass is being compiled; avoid dual compilations
+                    attn_out = flex_attention(q, k, v, block_mask=block_mask)
+                else:
+                    # Eager mode (e.g. within model.generate() loops); invoke the pre-compiled Triton kernel
+                    attn_out = self.flex_attention_compiled(q, k, v, block_mask=block_mask)
+
             except Exception as e:
                 logger.warning_once(f"FlexAttention compilation fell back to Dense GQA. Reason: {e}")
                 attn_out = self._grouped_dense_attention(q, k, v, attention_mask_4d)
@@ -831,7 +856,7 @@ class HumanVModel(HumanVPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    def _get_causal_mask(self, q_len: int, src_len: int, past_len: int, device: torch.device, dtype: torch.dtype):
+    def _get_causal_mask(self, q_len: int, src_len: int, past_len: int | torch.Tensor, device: torch.device, dtype: torch.dtype):
         neg_inf = _get_neg_inf(dtype)
         m = torch.triu(
             torch.full((q_len, src_len), neg_inf, device=device, dtype=dtype),
@@ -839,7 +864,7 @@ class HumanVModel(HumanVPreTrainedModel):
         )
         return m[None, None, :, :]
 
-    def _prepare_attention_masks(self, attention_mask_2d: torch.Tensor, q_len: int, past_len: int, dtype: torch.dtype):
+    def _prepare_attention_masks(self, attention_mask_2d: torch.Tensor, q_len: int, past_len: int | torch.Tensor, dtype: torch.dtype):
         device = attention_mask_2d.device
         src_len = int(attention_mask_2d.shape[1])
 
