@@ -24,6 +24,18 @@ Key fixes and features included:
 - Optimized VRAM retention via Inline Allocation of Auxiliary Losses.
 - Hardware-agnostic fallback to dense attention if FlexAttention is not supported.
 - Implemented Industrial-grade Paged KV Cache (HumanVPagedCache) compatible with FlexAttention.
+
+BUGFIX (this revision):
+- Fixed `HumanVPagedCache.__init__` raising
+  `cannot access local variable 'torch' where it is not associated with a value`.
+  Root cause: `import torch._dynamo` inside the function body implicitly declared
+  `torch` as a *local* variable for the entire enclosing function scope (Python
+  scoping rule: any assignment/import of a name anywhere in a function makes it
+  local for the whole function). This shadowed the module-level `torch` import
+  used earlier in `__init__` (e.g. `torch.zeros(...)`, `torch.full(...)`),
+  causing an UnboundLocalError at runtime. Fixed by importing the submodule
+  under an alias (`import torch._dynamo as torch_dynamo`) so the global `torch`
+  name is never shadowed locally.
 """
 
 from __future__ import annotations
@@ -161,15 +173,19 @@ class HumanVPagedCache(Cache):
         self.seq_lengths = torch.zeros(max_batch_size, dtype=torch.long, device=device)
         self.free_pages = list(range(num_pages))
 
-        # Register cache addresses as static to prevent Dynamo from skipping CUDA Graphs during in-place mutations
+        # Register cache addresses as static to prevent Dynamo from skipping CUDA Graphs during in-place mutations.
+        # NOTE: We import the submodule under an alias (`torch_dynamo`) instead of `import torch._dynamo`.
+        # Using the bare `import torch._dynamo` statement binds the name `torch` as a *local* variable
+        # for this entire function scope (Python scoping quirk), which shadows the module-level `torch`
+        # import used earlier in this same method and causes an UnboundLocalError at runtime.
         try:
-            import torch._dynamo
+            import torch._dynamo as torch_dynamo
             for layer_idx in range(self.num_layers):
-                torch._dynamo.mark_static_address(self.k_cache[layer_idx])
-                torch._dynamo.mark_static_address(self.v_cache[layer_idx])
-            torch._dynamo.mark_static_address(self.seq_lengths)
-            torch._dynamo.mark_static_address(self.page_table)
-            torch._dynamo.mark_static_address(self.physical_to_logical)
+                torch_dynamo.mark_static_address(self.k_cache[layer_idx])
+                torch_dynamo.mark_static_address(self.v_cache[layer_idx])
+            torch_dynamo.mark_static_address(self.seq_lengths)
+            torch_dynamo.mark_static_address(self.page_table)
+            torch_dynamo.mark_static_address(self.physical_to_logical)
         except Exception:
             pass
 
