@@ -161,6 +161,18 @@ class HumanVPagedCache(Cache):
         self.seq_lengths = torch.zeros(max_batch_size, dtype=torch.long, device=device)
         self.free_pages = list(range(num_pages))
 
+        # Register cache addresses as static to prevent Dynamo from skipping CUDA Graphs during in-place mutations
+        try:
+            import torch._dynamo
+            for layer_idx in range(self.num_layers):
+                torch._dynamo.mark_static_address(self.k_cache[layer_idx])
+                torch._dynamo.mark_static_address(self.v_cache[layer_idx])
+            torch._dynamo.mark_static_address(self.seq_lengths)
+            torch._dynamo.mark_static_address(self.page_table)
+            torch._dynamo.mark_static_address(self.physical_to_logical)
+        except Exception:
+            pass
+
     @property
     def batch_size(self) -> int:
         return self._max_batch_size
@@ -532,10 +544,14 @@ class HumanVAttention(nn.Module):
         if self.attn_backend not in ("gqa_matmul", "sdpa"):
             self.attn_backend = "gqa_matmul"
 
-        # Pre-compile the flex_attention function to optimize eager-mode calls
+        # Compile the flex_attention helper function with CUDA Graphs disabled to prevent overwrite errors in loops
         if HAS_FLEX:
             try:
-                self.flex_attention_compiled = torch.compile(flex_attention, dynamic=True)
+                self.flex_attention_compiled = torch.compile(
+                    flex_attention, 
+                    dynamic=True, 
+                    options={"triton.cudagraphs": False}
+                )
             except Exception:
                 self.flex_attention_compiled = flex_attention
         else:
@@ -694,7 +710,7 @@ class HumanVAttention(nn.Module):
                     # The whole forward pass is being compiled; avoid dual compilations
                     attn_out = flex_attention(q, k, v, block_mask=block_mask)
                 else:
-                    # Eager mode (e.g. within model.generate() loops); invoke the pre-compiled Triton kernel
+                    # Eager mode (e.g. within model.generate() loops); invoke the compiled Triton kernel safely
                     attn_out = self.flex_attention_compiled(q, k, v, block_mask=block_mask)
 
             except Exception as e:
