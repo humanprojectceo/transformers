@@ -23,6 +23,7 @@ Key fixes and features included:
 - Enabled compatibility with HF StaticCache and graph-friendly compilation (no dict caches).
 - Optimized VRAM retention via Inline Allocation of Auxiliary Losses.
 - Hardware-agnostic fallback to dense attention if FlexAttention is not supported.
+- Implemented Industrial-grade Paged KV Cache (HumanVPagedCache) compatible with FlexAttention.
 """
 
 from __future__ import annotations
@@ -100,6 +101,131 @@ def _sparse_mask_fn(
         return valid & padding_mask[b, kv_idx]
 
     return valid
+
+
+# -----------------------------------------------------------------------------
+# PyTorch FlexAttention Paged KV Cache Logical Mask Formulation (Option 1)
+# -----------------------------------------------------------------------------
+def _paged_local_global_mask(
+    b: torch.Tensor,
+    h: torch.Tensor,
+    q_idx: torch.Tensor,
+    physical_kv_idx: torch.Tensor,
+    page_size: int,
+    physical_to_logical: torch.Tensor,
+    block_size: int,
+    local_blocks: int,
+    global_blocks: int,
+    window_size: int,
+) -> torch.Tensor:
+    """
+    Logical mask function mapping physical scattered KV cache locations to logical token indices.
+    """
+    physical_page = physical_kv_idx // page_size
+    offset = physical_kv_idx % page_size
+    logical_page = physical_to_logical[b, physical_page]
+    
+    is_valid = logical_page >= 0
+    logical_kv_idx = logical_page * page_size + offset
+    
+    is_causal = q_idx >= logical_kv_idx
+    q_block = q_idx // block_size
+    kv_block = logical_kv_idx // block_size
+
+    is_global = kv_block < global_blocks
+    is_local = (kv_block <= q_block) & (kv_block >= q_block - local_blocks + 1)
+    valid = is_causal & (is_global | is_local)
+
+    if window_size > 0:
+        within_window = (q_idx - logical_kv_idx) < window_size
+        return valid & (within_window | is_global) & is_valid
+
+    return valid & is_valid
+
+
+# -----------------------------------------------------------------------------
+# Industrial-grade Paged KV Cache Class (Option 1 - Bottleneck 8)
+# -----------------------------------------------------------------------------
+class HumanVPagedCache(Cache):
+    """
+    Paged KV Cache manager engineered to align scattered GPU pages with PyTorch FlexAttention.
+    Guarantees fixed physical shapes during execution to prevent TorchInductor recompilations.
+    """
+    def __init__(self, config: HumanVConfig, max_batch_size: int, num_pages: int, page_size: int, device: torch.device, dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        self.num_pages = num_pages
+        self.page_size = page_size
+        self.max_batch_size = max_batch_size
+        self.device = device
+        self.dtype = dtype
+        
+        self.num_layers = config.num_hidden_layers
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        
+        # Pre-allocate contiguous physical page buffers in memory (Fixed Shape -> Zero Recompiles)
+        self.k_cache = [
+            torch.zeros((1, self.num_kv_heads, num_pages * page_size, self.head_dim), device=device, dtype=dtype)
+            for _ in range(self.num_layers)
+        ]
+        self.v_cache = [
+            torch.zeros((1, self.num_kv_heads, num_pages * page_size, self.head_dim), device=device, dtype=dtype)
+            for _ in range(self.num_layers)
+        ]
+        
+        # Logical-to-Physical page tables (maps logical sequence pages to scattered physical pages)
+        self.page_table = torch.full((max_batch_size, num_pages), -1, dtype=torch.long, device=device)
+        self.physical_to_logical = torch.full((max_batch_size, num_pages), -1, dtype=torch.long, device=device)
+        self.seq_lengths = torch.zeros(max_batch_size, dtype=torch.long, device=device)
+        self.free_pages = list(range(num_pages))
+
+    def allocate_page(self, batch_idx: int, logical_page_idx: int) -> int:
+        if not self.free_pages:
+            raise RuntimeError("Out of physical pages in HumanVPagedCache!")
+        physical_page_idx = self.free_pages.pop(0)
+        self.page_table[batch_idx, logical_page_idx] = physical_page_idx
+        self.physical_to_logical[batch_idx, physical_page_idx] = logical_page_idx
+        return physical_page_idx
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[dict] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        bsz, num_kv_heads, q_len, head_dim = key_states.shape
+        device = key_states.device
+        
+        is_first_layer = (layer_idx == 0)
+        
+        # Vectorized logical page mapping directly on GPU (Blazing fast compared to CPU loop-tokens)
+        for b in range(bsz):
+            start_len = int(self.seq_lengths[b].item())
+            logical_positions = torch.arange(start_len, start_len + q_len, device=device)
+            logical_pages = logical_positions // self.page_size
+            offsets = logical_positions % self.page_size
+            
+            if is_first_layer:
+                unique_pages = torch.unique(logical_pages)
+                for lp in unique_pages:
+                    lp_idx = int(lp.item())
+                    if self.page_table[b, lp_idx] == -1:
+                        self.allocate_page(b, lp_idx)
+            
+            physical_pages = self.page_table[b, logical_pages]
+            physical_indices = physical_pages * self.page_size + offsets
+            
+            self.k_cache[layer_idx][0, :, physical_indices, :] = key_states[b]
+            self.v_cache[layer_idx][0, :, physical_indices, :] = value_states[b]
+            
+            if is_first_layer:
+                self.seq_lengths[b] += q_len
+                
+        return self.k_cache[layer_idx], self.v_cache[layer_idx]
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        return int(self.seq_lengths.max().item())
 
 
 # -----------------------------------------------------------------------------
@@ -458,8 +584,8 @@ class HumanVAttention(nn.Module):
             and self.sparse_attention_impl == "local_global_block"
         )
 
-        # Check if FlexAttention is supported on current GPU/Triton capability (Graceful Fallback)
         has_flex_support = HAS_FLEX and q.is_cuda
+        is_paged_cache = past_key_values is not None and past_key_values.__class__.__name__ == "HumanVPagedCache"
 
         if use_sparse and has_flex_support:
             try:
@@ -467,37 +593,47 @@ class HumanVAttention(nn.Module):
                 k = self._repeat_kv(k, self.num_kv_groups)
                 v = self._repeat_kv(v, self.num_kv_groups)
 
-                # 2. Setup Boolean Padding mask for FlexAttention
-                pad_mask = attention_mask_2d.to(dtype=torch.bool) if attention_mask_2d is not None else None
-
-                # 3. Create logical mask on-the-fly and compile via Triton (Bottleneck 2)
-                mask_mod = partial(
-                    _sparse_mask_fn,
-                    block_size=self.sparse_block_size,
-                    local_blocks=self.sparse_local_num_blocks,
-                    global_blocks=self.sparse_global_num_blocks,
-                    window_size=self.sparse_attention_window,
-                    padding_mask=pad_mask,
-                )
+                if is_paged_cache:
+                    # Construct Logical-to-Physical BlockMask for Paged KV Cache (Bottleneck 8/2 - Option 1)
+                    mask_mod = partial(
+                        _paged_local_global_mask,
+                        page_size=past_key_values.page_size,
+                        physical_to_logical=past_key_values.physical_to_logical,
+                        block_size=self.sparse_block_size,
+                        local_blocks=self.sparse_local_num_blocks,
+                        global_blocks=self.sparse_global_num_blocks,
+                        window_size=self.sparse_attention_window,
+                    )
+                    kv_len = past_key_values.num_pages * past_key_values.page_size
+                else:
+                    # Setup Boolean Padding mask for Dynamic/Static Caches
+                    pad_mask = attention_mask_2d.to(dtype=torch.bool) if attention_mask_2d is not None else None
+                    mask_mod = partial(
+                        _sparse_mask_fn,
+                        block_size=self.sparse_block_size,
+                        local_blocks=self.sparse_local_num_blocks,
+                        global_blocks=self.sparse_global_num_blocks,
+                        window_size=self.sparse_attention_window,
+                        padding_mask=pad_mask,
+                    )
+                    kv_len = k_len
 
                 block_mask = create_block_mask(
                     mask_mod,
                     B=bsz,
                     H=None,  # Broadcast mask across heads
                     Q_LEN=q_len,
-                    KV_LEN=k_len,
+                    KV_LEN=kv_len,
                     device=q.device,
                     _compile=True,  # JIT pre-compilation
                 )
 
-                # 4. Execute fused FlexAttention
+                # Execute fused FlexAttention (natively broadcasts k & v batch dimension if paged cache has B=1)
                 attn_out = flex_attention(q, k, v, block_mask=block_mask)
             except Exception as e:
-                # Fallback to standard 4D attention if Triton compilation fails on specific GPUs
                 logger.warning_once(f"FlexAttention compilation fell back to Dense GQA. Reason: {e}")
                 attn_out = self._grouped_dense_attention(q, k, v, attention_mask_4d)
         else:
-            # CPU or Non-Triton GPUs fall back to highly optimized dense 4D attention
             if use_sparse:
                 attn_out = self._grouped_dense_attention(q, k, v, attention_mask_4d)
             else:
@@ -712,7 +848,7 @@ class HumanVModel(HumanVPreTrainedModel):
         past_len = past_key_values.get_seq_length() if (past_key_values is not None and use_cache) else 0
 
         # Dynamic KV length tracking matching pre-allocated static/dynamic buffers (Bottleneck 8)
-        # Safeguard: Verify the cache is explicitly an active StaticCache before querying properties (Avoid May 2026/v5 empty-cache max() exceptions)
+        # Safeguard: Verify the cache is explicitly an active StaticCache before querying properties (Avoid empty-cache max() exceptions)
         is_static_cache = past_key_values is not None and past_key_values.__class__.__name__ == "StaticCache"
         if use_cache and is_static_cache:
             max_cache_len = getattr(past_key_values, "max_cache_len", -1)
@@ -904,4 +1040,4 @@ class HumanVForCausalLM(HumanVPreTrainedModel, GenerationMixin):
         }
 
 
-__all__ = ["HumanVForCausalLM", "HumanVModel", "HumanVPreTrainedModel"]
+__all__ = ["HumanVForCausalLM", "HumanVModel", "HumanVPreTrainedModel", "HumanVPagedCache"]
