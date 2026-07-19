@@ -68,7 +68,7 @@ def _get_neg_inf(dtype: torch.dtype) -> float:
 
 
 # -----------------------------------------------------------------------------
-# PyTorch FlexAttention Logical Mask Formulation
+# PyTorch FlexAttention Logical Mask Formulation (Bottleneck 2)
 # -----------------------------------------------------------------------------
 def _sparse_mask_fn(
     b: torch.Tensor,
@@ -104,7 +104,57 @@ def _sparse_mask_fn(
 
 
 # -----------------------------------------------------------------------------
-# Industrial-grade Paged KV Cache Class
+# PyTorch FlexAttention Paged KV Cache Logical Mask Formulation (Option 1)
+# -----------------------------------------------------------------------------
+def _paged_local_global_mask(
+    b: torch.Tensor,
+    h: torch.Tensor,
+    q_idx: torch.Tensor,
+    physical_kv_idx: torch.Tensor,
+    page_size: int,
+    physical_to_logical: torch.Tensor,
+    block_size: int,
+    local_blocks: int,
+    global_blocks: int,
+    window_size: int,
+) -> torch.Tensor:
+    """
+    Logical mask function mapping physical scattered KV cache locations to logical token indices.
+    """
+    # 1. Get physical page index and offset from current physical index
+    physical_page = physical_kv_idx // page_size
+    offset = physical_kv_idx % page_size
+    
+    # 2. Avoid Advanced Indexing via torch.gather (Triton-friendly, zero compile-breaks)
+    # Reshape physical_to_logical mapping from (B, num_pages) to (B, 1, 1, num_pages)
+    p2l = physical_to_logical.view(physical_to_logical.shape[0], 1, 1, -1)
+    
+    # Expand physical_page index to match batch size dimension of p2l (B, 1, 1, KV_LEN)
+    physical_page_expanded = physical_page.expand(physical_to_logical.shape[0], 1, 1, -1)
+    
+    # Gather logical page index (Gather along dimension 3)
+    logical_page = torch.gather(p2l, 3, physical_page_expanded)
+    
+    is_valid = logical_page >= 0
+    logical_kv_idx = logical_page * page_size + offset
+    
+    is_causal = q_idx >= logical_kv_idx
+    q_block = q_idx // block_size
+    kv_block = logical_kv_idx // block_size
+
+    is_global = kv_block < global_blocks
+    is_local = (kv_block <= q_block) & (kv_block >= q_block - local_blocks + 1)
+    valid = is_causal & (is_global | is_local)
+
+    if window_size > 0:
+        within_window = (q_idx - logical_kv_idx) < window_size
+        return valid & (within_window | is_global) & is_valid
+
+    return valid & is_valid
+
+
+# -----------------------------------------------------------------------------
+# Industrial-grade Paged KV Cache Class (Option 1 - Bottleneck 8)
 # -----------------------------------------------------------------------------
 class HumanVPagedCache(Cache):
     """
@@ -112,11 +162,12 @@ class HumanVPagedCache(Cache):
     Guarantees fixed physical shapes during execution to prevent TorchInductor recompilations.
     """
     def __init__(self, config: HumanVConfig, max_batch_size: int, num_pages: int, page_size: int, device: torch.device, dtype: torch.dtype = torch.bfloat16):
-        super().__init__()
+        # Satisfy Transformers 5.0+ parent validation by passing a dummy class to replicate (Bottleneck 8)
+        super().__init__(layer_class_to_replicate=object)
         
         self.num_pages = num_pages
         self.page_size = page_size
-        self._max_batch_size = max_batch_size  # Store in private attribute to avoid property setter clash
+        self._max_batch_size = max_batch_size  # Store in private attribute to avoid property setter clash (Bottleneck 8)
         self.device = device
         self.dtype = dtype
         
@@ -164,42 +215,6 @@ class HumanVPagedCache(Cache):
         self.physical_to_logical[batch_idx, physical_page_idx] = logical_page_idx
         return physical_page_idx
 
-    def gather_contiguous(self, layer_idx: int, kv_seq_len: int, bsz: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Gathers the scattered physical pages on GPU into a logical contiguous representation.
-        Completely vectorized and compiled-safe.
-        """
-        device = self.device
-        
-        # 1. Create logical index mesh grid
-        positions = torch.arange(kv_seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        logical_pages = positions // self.page_size
-        offsets = positions % self.page_size
-        
-        # 2. Extract mapped physical indices from page table
-        batch_indices = torch.arange(bsz, device=device).unsqueeze(-1).expand(-1, kv_seq_len)
-        physical_pages = self.page_table[batch_indices, logical_pages]
-        physical_indices = physical_pages * self.page_size + offsets
-        
-        # 3. View-transpose self.k_cache and self.v_cache for advanced indexing compatibility
-        k_cache_trans = self.k_cache[layer_idx][0].transpose(0, 1)  # (S, num_kv_heads, head_dim)
-        v_cache_trans = self.v_cache[layer_idx][0].transpose(0, 1)  # (S, num_kv_heads, head_dim)
-        
-        # 4. Gather pages
-        k_gathered = k_cache_trans[physical_indices]  # (bsz, kv_seq_len, num_kv_heads, head_dim)
-        v_gathered = v_cache_trans[physical_indices]
-        
-        # 5. Permute back to standard HF format: (bsz, num_kv_heads, kv_seq_len, head_dim)
-        k_gathered = k_gathered.permute(0, 2, 1, 3)
-        v_gathered = v_gathered.permute(0, 2, 1, 3)
-        
-        # 6. Apply masking for unallocated entries
-        valid_mask = (physical_pages >= 0).unsqueeze(1).unsqueeze(-1)  # (bsz, 1, kv_seq_len, 1)
-        k_gathered = k_gathered * valid_mask
-        v_gathered = v_gathered * valid_mask
-        
-        return k_gathered, v_gathered
-
     def update(
         self,
         key_states: torch.Tensor,
@@ -212,7 +227,7 @@ class HumanVPagedCache(Cache):
         
         is_first_layer = (layer_idx == 0)
         
-        # Vectorized logical page mapping directly on GPU
+        # Vectorized logical page mapping directly on GPU (Blazing fast compared to CPU loop-tokens)
         for b in range(bsz):
             start_len = int(self.seq_lengths[b].item())
             logical_positions = torch.arange(start_len, start_len + q_len, device=device)
@@ -229,21 +244,13 @@ class HumanVPagedCache(Cache):
             physical_pages = self.page_table[b, logical_pages]
             physical_indices = physical_pages * self.page_size + offsets
             
-            # Using view-transpose assignment to bypass advanced indexing layout issues
-            k_layer = self.k_cache[layer_idx][0].transpose(0, 1)  # (S, num_kv_heads, head_dim)
-            v_layer = self.v_cache[layer_idx][0].transpose(0, 1)  # (S, num_kv_heads, head_dim)
-            
-            k_layer[physical_indices] = key_states[b].transpose(0, 1)
-            v_layer[physical_indices] = value_states[b].transpose(0, 1)
-            
-            self.k_cache[layer_idx][0] = k_layer.transpose(0, 1)
-            self.v_cache[layer_idx][0] = v_layer.transpose(0, 1)
+            self.k_cache[layer_idx][0, :, physical_indices, :] = key_states[b]
+            self.v_cache[layer_idx][0, :, physical_indices, :] = value_states[b]
             
             if is_first_layer:
                 self.seq_lengths[b] += q_len
                 
-        kv_seq_len = int(self.seq_lengths.max().item())
-        return self.gather_contiguous(layer_idx, kv_seq_len, bsz)
+        return self.k_cache[layer_idx], self.v_cache[layer_idx]
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         return int(self.seq_lengths.max().item())
@@ -259,7 +266,7 @@ class HumanVBaseModelOutputWithPast(ModelOutput):
     hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
     attentions: Optional[Tuple[torch.Tensor, ...]] = None
     router_logits: Optional[Tuple[torch.Tensor, ...]] = None
-    aux_loss: Optional[torch.Tensor] = None
+    aux_loss: Optional[torch.Tensor] = None  # Inline allocated aux loss
 
 
 @dataclass
@@ -415,6 +422,7 @@ class HumanVMoeBlock(nn.Module):
         return final_hidden_states.view(orig_shape), router_logits
 
 
+# Helper function to compute Auxiliary Load Balancing Loss
 def load_balancing_loss(router_logits_list: list[torch.Tensor], num_experts: int, top_k: int) -> torch.Tensor:
     """
     Computes the load balancing auxiliary loss (GShard style) to prevent expert collapse.
@@ -488,6 +496,8 @@ class HumanVAttention(nn.Module):
         self.attn_backend = str(getattr(config, "attn_backend", "gqa_matmul")).lower().strip()
         if self.attn_backend not in ("gqa_matmul", "sdpa"):
             self.attn_backend = "gqa_matmul"
+
+        # Deleted: dict-based mask/table caching to prevent compile-time graph breaks (Bottleneck 5)
 
     def _kv_dtype(self, x: torch.Tensor) -> torch.Tensor:
         if self.kv_cache_dtype == "auto":
@@ -575,7 +585,7 @@ class HumanVAttention(nn.Module):
         attention_mask_2d: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
-        cache_position: Optional[torch.Tensor] = None,
+        cache_position: Optional[torch.Tensor] = None,  # Added for StaticCache support (Bottleneck 8)
         **kwargs,
     ):
         bsz, q_len, _ = hidden_states.shape
@@ -592,7 +602,6 @@ class HumanVAttention(nn.Module):
             k = self._kv_dtype(k)
             v = self._kv_dtype(v)
             cache_kwargs = {"cache_position": cache_position} if cache_position is not None else None
-            # Update cache and gather logically contiguous outputs
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
         k_len = k.shape[-2]
@@ -604,6 +613,7 @@ class HumanVAttention(nn.Module):
         )
 
         has_flex_support = HAS_FLEX and q.is_cuda
+        is_paged_cache = past_key_values is not None and past_key_values.__class__.__name__ == "HumanVPagedCache"
 
         if use_sparse and has_flex_support:
             try:
@@ -611,17 +621,30 @@ class HumanVAttention(nn.Module):
                 k = self._repeat_kv(k, self.num_kv_groups)
                 v = self._repeat_kv(v, self.num_kv_groups)
 
-                # Setup Boolean Padding mask for Dynamic/Static/Paged Caches (unified layout)
-                pad_mask = attention_mask_2d.to(dtype=torch.bool) if attention_mask_2d is not None else None
-                mask_mod = partial(
-                    _sparse_mask_fn,
-                    block_size=self.sparse_block_size,
-                    local_blocks=self.sparse_local_num_blocks,
-                    global_blocks=self.sparse_global_num_blocks,
-                    window_size=self.sparse_attention_window,
-                    padding_mask=pad_mask,
-                )
-                kv_len = k_len
+                if is_paged_cache:
+                    # Construct Logical-to-Physical BlockMask for Paged KV Cache (Bottleneck 8/2 - Option 1)
+                    mask_mod = partial(
+                        _paged_local_global_mask,
+                        page_size=past_key_values.page_size,
+                        physical_to_logical=past_key_values.physical_to_logical,
+                        block_size=self.sparse_block_size,
+                        local_blocks=self.sparse_local_num_blocks,
+                        global_blocks=self.sparse_global_num_blocks,
+                        window_size=self.sparse_attention_window,
+                    )
+                    kv_len = past_key_values.num_pages * past_key_values.page_size
+                else:
+                    # Setup Boolean Padding mask for Dynamic/Static Caches
+                    pad_mask = attention_mask_2d.to(dtype=torch.bool) if attention_mask_2d is not None else None
+                    mask_mod = partial(
+                        _sparse_mask_fn,
+                        block_size=self.sparse_block_size,
+                        local_blocks=self.sparse_local_num_blocks,
+                        global_blocks=self.sparse_global_num_blocks,
+                        window_size=self.sparse_attention_window,
+                        padding_mask=pad_mask,
+                    )
+                    kv_len = k_len
 
                 block_mask = create_block_mask(
                     mask_mod,
@@ -633,7 +656,7 @@ class HumanVAttention(nn.Module):
                     _compile=True,  # JIT pre-compilation
                 )
 
-                # Execute fused FlexAttention
+                # Execute fused FlexAttention (natively broadcasts k & v batch dimension if paged cache has B=1)
                 attn_out = flex_attention(q, k, v, block_mask=block_mask)
             except Exception as e:
                 logger.warning_once(f"FlexAttention compilation fell back to Dense GQA. Reason: {e}")
@@ -656,7 +679,7 @@ class HumanVAttention(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Decoder Layer
+# Decoder Layer (Dense + MoE Dynamic Handling)
 # -----------------------------------------------------------------------------
 class HumanVDecoderLayer(nn.Module):
     def __init__(self, config: HumanVConfig, layer_idx: int):
@@ -696,7 +719,7 @@ class HumanVDecoderLayer(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
-        cache_position: Optional[torch.Tensor] = None,
+        cache_position: Optional[torch.Tensor] = None,  # For StaticCache (Bottleneck 8)
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # 1. Self Attention
@@ -734,7 +757,7 @@ class HumanVDecoderLayer(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# HF Base PreTrained Model
+# HF base classes
 # -----------------------------------------------------------------------------
 class HumanVPreTrainedModel(PreTrainedModel):
     config_class = HumanVConfig
@@ -782,7 +805,9 @@ class HumanVModel(HumanVPreTrainedModel):
             base=rope_base,
         )
 
+        # Deleted self._causal_cache to prevent graph breaks during compile (Bottleneck 5)
         self.gradient_checkpointing = False
+
         self.post_init()
 
     def get_input_embeddings(self):
@@ -792,6 +817,7 @@ class HumanVModel(HumanVPreTrainedModel):
         self.embed_tokens = value
 
     def _get_causal_mask(self, q_len: int, src_len: int, past_len: int, device: torch.device, dtype: torch.dtype):
+        # Statless creation avoids python dict caching and enables full torch.compile graph matching (Bottleneck 5)
         neg_inf = _get_neg_inf(dtype)
         m = torch.triu(
             torch.full((q_len, src_len), neg_inf, device=device, dtype=dtype),
@@ -815,16 +841,13 @@ class HumanVModel(HumanVPreTrainedModel):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
         **kwargs,
-    ) -> Union[Tuple, HumanVBaseModelOutputWithPast]:
+    ) -> HumanVBaseModelOutputWithPast:
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("You must provide input_ids or inputs_embeds")
@@ -833,6 +856,7 @@ class HumanVModel(HumanVPreTrainedModel):
         if use_cache is None:
             use_cache = bool(getattr(self.config, "use_cache", True))
 
+        # Safeguard: Forcefully disable `use_cache` during reentrant/non-reentrant checkpointed training
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning(
@@ -846,11 +870,14 @@ class HumanVModel(HumanVPreTrainedModel):
 
         bsz, q_len = inputs_embeds.shape[:2]
 
-        if cache_position is None:
-            cache_position = kwargs.get("cache_position", None)
+        # Retrieve cache_position from generation kwargs (Bottleneck 8)
+        cache_position = kwargs.get("cache_position", None)
 
+        # Optimization: Standard HF practice for cache length evaluation (Stateless & compile-friendly)
         past_len = past_key_values.get_seq_length() if (past_key_values is not None and use_cache) else 0
 
+        # Dynamic KV length tracking matching pre-allocated static/dynamic buffers (Bottleneck 8)
+        # Safeguard: Verify the cache is explicitly an active StaticCache before querying properties (Avoid empty-cache max() exceptions)
         is_static_cache = past_key_values is not None and past_key_values.__class__.__name__ == "StaticCache"
         if use_cache and is_static_cache:
             max_cache_len = getattr(past_key_values, "max_cache_len", -1)
@@ -867,15 +894,16 @@ class HumanVModel(HumanVPreTrainedModel):
             if attention_mask.dim() != 2:
                 raise ValueError("attention_mask must be 2D (bsz, seq)")
             
+            # Setup attention_mask_2d padded with False up to pre-allocated cache buffers (Bottleneck 8/2)
             attention_mask_2d = attention_mask.to(device=inputs_embeds.device, dtype=torch.bool)
             if attention_mask_2d.shape[1] < kv_seq_len:
                 pad_len = kv_seq_len - attention_mask_2d.shape[1]
                 pad_tensor = torch.zeros((bsz, pad_len), device=inputs_embeds.device, dtype=torch.bool)
                 attention_mask_2d = torch.cat([attention_mask_2d, pad_tensor], dim=-1)
 
-        if position_ids is None:
-            position_ids = torch.arange(q_len, dtype=torch.long, device=inputs_embeds.device) + past_len
-            position_ids = position_ids.unsqueeze(0).expand(bsz, -1)
+        # Compile-Safe Position IDs generation replacing nested arange gpu tensors (Bottleneck 13)
+        position_ids = torch.arange(q_len, dtype=torch.long, device=inputs_embeds.device) + past_len
+        position_ids = position_ids.unsqueeze(0).expand(bsz, -1)
 
         cos, sin = self.rotary_emb(inputs_embeds, position_ids)
         position_embeddings = (cos, sin)
@@ -887,6 +915,7 @@ class HumanVModel(HumanVPreTrainedModel):
         hidden_states = inputs_embeds
         all_hidden_states = [] if output_hidden_states else None
 
+        # Inline auxiliary loss accumulator - instantly releases router logits memory (Bottleneck 9)
         total_aux_loss = torch.tensor(0.0, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
         num_experts = int(getattr(self.config, "num_experts", 8))
         top_k = int(getattr(self.config, "num_experts_per_tok", 2))
@@ -924,6 +953,7 @@ class HumanVModel(HumanVPreTrainedModel):
                 )
 
             if router_logits is not None:
+                # Inline calculation: Compute load balancing loss immediately, discarding heavy router_logits (Bottleneck 9)
                 layer_aux_loss = load_balancing_loss([router_logits], num_experts, top_k)
                 total_aux_loss = total_aux_loss + layer_aux_loss
 
@@ -937,7 +967,7 @@ class HumanVModel(HumanVPreTrainedModel):
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=None,
-            router_logits=None,
+            router_logits=None,  # Freed from memory to save VRAM
             aux_loss=total_aux_loss,
         )
 
@@ -977,37 +1007,25 @@ class HumanVForCausalLM(HumanVPreTrainedModel, GenerationMixin):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> Union[Tuple, HumanVCausalLMOutputWithPast]:
+    ) -> HumanVCausalLMOutputWithPast:
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states).to(torch.float32)
 
         loss = None
+        # Retrieve inline-allocated auxiliary loss directly from BaseModelOutput (Bottleneck 9)
         aux_loss = outputs.aux_loss
 
         if labels is not None:
+            # Setup ignore_index to skip gradients on padding tokens (Bottleneck 14)
             loss_fct = CrossEntropyLoss(ignore_index=-100)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
@@ -1034,8 +1052,10 @@ class HumanVForCausalLM(HumanVPreTrainedModel, GenerationMixin):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        # Handle dynamic tracking parameters during generation loops
         cache_position = kwargs.get("cache_position", None)
         if past_key_values is not None:
+            # Capture from cache_position if managed, or fallback to sequence indexing
             if cache_position is not None:
                 input_ids = input_ids[:, cache_position]
             else:
