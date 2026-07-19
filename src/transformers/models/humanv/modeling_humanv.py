@@ -61,6 +61,7 @@ logger = logging.get_logger(__name__)
 def _get_neg_inf(dtype: torch.dtype) -> float:
     """
     Computes a dynamically scaled negative infinity fallback value based on the tensor's precision.
+    This prevents half-precision overflows in floating-point operations.
     """
     if dtype in (torch.float16, torch.half):
         return -30000.0
@@ -84,6 +85,17 @@ def _sparse_mask_fn(
     """
     Logical function defining the local-global block sparse attention pattern.
     Compiles down into a highly efficient, single-fused Triton kernel.
+    
+    Args:
+        b: Batch dimension tensor.
+        h: Head dimension tensor.
+        q_idx: Query token index tensor.
+        kv_idx: Key/Value token index tensor.
+        block_size: Dimension size of each block.
+        local_blocks: Number of local blocks to attend to.
+        global_blocks: Number of initial global blocks to attend to.
+        window_size: Sliding window constraint parameter.
+        padding_mask: Boolean tensor mask representing sequence padding.
     """
     is_causal = q_idx >= kv_idx
     q_block = q_idx // block_size
@@ -111,13 +123,21 @@ class HumanVPagedCache(Cache):
     Paged KV Cache manager engineered to align scattered GPU pages with PyTorch FlexAttention.
     Guarantees fixed physical shapes during execution to prevent TorchInductor recompilations.
     """
-    def __init__(self, config: HumanVConfig, max_batch_size: int, num_pages: int, page_size: int, device: torch.device, dtype: torch.dtype = torch.bfloat16):
-        # Satisfy Transformers parent validation (provide exactly one of layers or layer_class_to_replicate)
+    def __init__(
+        self, 
+        config: HumanVConfig, 
+        max_batch_size: int, 
+        num_pages: int, 
+        page_size: int, 
+        device: torch.device, 
+        dtype: torch.dtype = torch.bfloat16
+    ):
+        # Satisfy Transformers parent validation requirements by supplying a dummy class for replication
         super().__init__(layer_class_to_replicate=object)
         
         self.num_pages = num_pages
         self.page_size = page_size
-        self._max_batch_size = max_batch_size  # Store in private attribute to avoid property setter clash
+        self._max_batch_size = max_batch_size  # Private attribute prevents parent property setter clashes
         self.device = device
         self.dtype = dtype
         
@@ -125,7 +145,7 @@ class HumanVPagedCache(Cache):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         
-        # Pre-allocate contiguous physical page buffers in memory (Fixed Shape -> Zero Recompiles)
+        # Pre-allocate contiguous physical page buffers in GPU memory (Fixed Shape -> Zero JIT Recompiles)
         self.k_cache = [
             torch.zeros((1, self.num_kv_heads, num_pages * page_size, self.head_dim), device=device, dtype=dtype)
             for _ in range(self.num_layers)
@@ -135,7 +155,7 @@ class HumanVPagedCache(Cache):
             for _ in range(self.num_layers)
         ]
         
-        # Logical-to-Physical page tables (maps logical sequence pages to scattered physical pages)
+        # Logical-to-Physical mapping tables
         self.page_table = torch.full((max_batch_size, num_pages), -1, dtype=torch.long, device=device)
         self.physical_to_logical = torch.full((max_batch_size, num_pages), -1, dtype=torch.long, device=device)
         self.seq_lengths = torch.zeros(max_batch_size, dtype=torch.long, device=device)
@@ -158,6 +178,7 @@ class HumanVPagedCache(Cache):
         return True
 
     def allocate_page(self, batch_idx: int, logical_page_idx: int) -> int:
+        """Allocates a free physical page to a logical sequence page index."""
         if not self.free_pages:
             raise RuntimeError("Out of physical pages in HumanVPagedCache!")
         physical_page_idx = self.free_pages.pop(0)
@@ -167,22 +188,22 @@ class HumanVPagedCache(Cache):
 
     def gather_contiguous(self, layer_idx: int, kv_seq_len: int, bsz: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Gathers the scattered physical pages on GPU into a logical contiguous representation.
-        Completely vectorized and compiled-safe.
+        Gathers scattered physical pages on GPU memory into a logical contiguous representation.
+        Completely vectorized and fully compile-friendly.
         """
         device = self.device
         
-        # 1. Create logical index mesh grid
+        # 1. Create a logical index mesh grid
         positions = torch.arange(kv_seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         logical_pages = positions // self.page_size
         offsets = positions % self.page_size
         
-        # 2. Extract mapped physical indices from page table
+        # 2. Extract mapped physical indices from the page table
         batch_indices = torch.arange(bsz, device=device).unsqueeze(-1).expand(-1, kv_seq_len)
         physical_pages = self.page_table[batch_indices, logical_pages]
         physical_indices = physical_pages * self.page_size + offsets
         
-        # 3. Direct gather using indexing without transposing entire cache
+        # 3. Direct gather using indexing without transposing entire raw cache
         k_cache_trans = self.k_cache[layer_idx][0].transpose(0, 1)  # (S, num_kv_heads, head_dim)
         v_cache_trans = self.v_cache[layer_idx][0].transpose(0, 1)  # (S, num_kv_heads, head_dim)
         
@@ -207,6 +228,10 @@ class HumanVPagedCache(Cache):
         layer_idx: int,
         cache_kwargs: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Updates the paged cache buffers with incoming query step Key and Value states.
+        Handles advanced indexing alignment natively with no transpose overhead on LHS.
+        """
         bsz, num_kv_heads, q_len, head_dim = key_states.shape
         device = key_states.device
         
@@ -229,9 +254,10 @@ class HumanVPagedCache(Cache):
             physical_pages = self.page_table[b, logical_pages]
             physical_indices = physical_pages * self.page_size + offsets
             
-            # Pure in-place advanced indexing for contiguous memory writes (highly compile-friendly)
-            self.k_cache[layer_idx][0, :, physical_indices, :] = key_states[b].transpose(0, 1).to(dtype=self.k_cache[layer_idx].dtype)
-            self.v_cache[layer_idx][0, :, physical_indices, :] = value_states[b].transpose(0, 1).to(dtype=self.v_cache[layer_idx].dtype)
+            # Direct in-place assignment matching PyTorch advanced indexing. 
+            # No transpose needed on RHS since the indexing slice retains the default dimension layout.
+            self.k_cache[layer_idx][0, :, physical_indices, :] = key_states[b].to(dtype=self.k_cache[layer_idx].dtype)
+            self.v_cache[layer_idx][0, :, physical_indices, :] = value_states[b].to(dtype=self.v_cache[layer_idx].dtype)
             
             if is_first_layer:
                 self.seq_lengths[b] += q_len
@@ -248,6 +274,7 @@ class HumanVPagedCache(Cache):
 # -----------------------------------------------------------------------------
 @dataclass
 class HumanVBaseModelOutputWithPast(ModelOutput):
+    """Base class for HumanV model outputs, including optional MoE routing metadata."""
     last_hidden_state: torch.Tensor = None
     past_key_values: Optional[Cache] = None
     hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
@@ -258,6 +285,7 @@ class HumanVBaseModelOutputWithPast(ModelOutput):
 
 @dataclass
 class HumanVCausalLMOutputWithPast(ModelOutput):
+    """Base class for HumanV causal language model outputs."""
     loss: Optional[torch.Tensor] = None
     aux_loss: Optional[torch.Tensor] = None
     logits: torch.Tensor = None
@@ -268,9 +296,10 @@ class HumanVCausalLMOutputWithPast(ModelOutput):
 
 
 # -----------------------------------------------------------------------------
-# Norms
+# Normalization Layers
 # -----------------------------------------------------------------------------
 class HumanVRMSNorm(nn.Module):
+    """Custom standard root-mean-square normalization (fallback option)."""
     def __init__(self, hidden_size: int, eps: float):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -285,6 +314,7 @@ class HumanVRMSNorm(nn.Module):
 
 
 class HumanVTorchRMSNorm(nn.Module):
+    """PyTorch native RMSNorm module wrapping, defaulting to native performance if available."""
     def __init__(self, hidden_size: int, eps: float):
         super().__init__()
         if hasattr(nn, "RMSNorm"):
@@ -297,15 +327,17 @@ class HumanVTorchRMSNorm(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# RoPE helpers
+# Rotary Position Embeddings (RoPE)
 # -----------------------------------------------------------------------------
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half of the hidden dimension values for RoPE formulation."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
 def _apply_rotary(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """Applies the sinusoidal rotary embeddings to query and key states."""
     cos = cos.unsqueeze(1)  # (B, 1, T, D)
     sin = sin.unsqueeze(1)  # (B, 1, T, D)
     q = (q * cos) + (_rotate_half(q) * sin)
@@ -314,6 +346,7 @@ def _apply_rotary(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torc
 
 
 class HumanVRotaryEmbedding(nn.Module):
+    """Constructs compile-safe sinusoidal cache arrays for Rotary Position Embeddings."""
     def __init__(self, dim: int, max_position_embeddings: int, base: float = 10000.0):
         super().__init__()
         self.dim = dim
@@ -349,9 +382,10 @@ class HumanVRotaryEmbedding(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# MLP (Standard Dense MLP Block)
+# Multi-Layer Perceptrons (MLP)
 # -----------------------------------------------------------------------------
 class HumanVMLP(nn.Module):
+    """Standard multi-layer perceptron (MLP) block using Gated Linear Units."""
     def __init__(self, config: HumanVConfig):
         super().__init__()
         hidden_size = int(getattr(config, "hidden_size"))
@@ -369,9 +403,10 @@ class HumanVMLP(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Sparse MoE Block
+# Sparse Mixture of Experts (MoE)
 # -----------------------------------------------------------------------------
 class HumanVMoeBlock(nn.Module):
+    """Sparse Mixture of Experts (MoE) block with dynamic Top-K token routing."""
     def __init__(self, config: HumanVConfig):
         super().__init__()
         self.hidden_size = int(getattr(config, "hidden_size"))
@@ -390,6 +425,7 @@ class HumanVMoeBlock(nn.Module):
 
         top_k_weights, top_k_indices = torch.topk(routing_weights, self.top_k, dim=-1)
 
+        # Normalize routing weights over Top-K selected experts
         top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         top_k_weights = top_k_weights.to(hidden_states.dtype)
 
@@ -411,7 +447,7 @@ class HumanVMoeBlock(nn.Module):
 
 def load_balancing_loss(router_logits_list: list[torch.Tensor], num_experts: int, top_k: int) -> torch.Tensor:
     """
-    Computes the load balancing auxiliary loss (GShard style) to prevent expert collapse.
+    Computes GShard load balancing auxiliary loss to penalize expert overload and prevent routing collapse.
     """
     if not router_logits_list:
         return torch.tensor(0.0)
@@ -438,6 +474,9 @@ def load_balancing_loss(router_logits_list: list[torch.Tensor], num_experts: int
 # Attention (Dense + Sparse local/global block via FlexAttention)
 # -----------------------------------------------------------------------------
 class HumanVAttention(nn.Module):
+    """
+    Unified attention layer managing GQA (Grouped Query Attention) and sliding window sparse patterns.
+    """
     def __init__(self, config: HumanVConfig, layer_idx: int, layer_type: str):
         super().__init__()
         self.config = config
@@ -484,6 +523,7 @@ class HumanVAttention(nn.Module):
             self.attn_backend = "gqa_matmul"
 
     def _kv_dtype(self, x: torch.Tensor) -> torch.Tensor:
+        """Casts incoming key/value tensor states to specified precision formats."""
         if self.kv_cache_dtype == "auto":
             return x
         if self.kv_cache_dtype in ("bf16", "bfloat16"):
@@ -495,6 +535,7 @@ class HumanVAttention(nn.Module):
         return x
 
     def _repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """Expands Key-Value head counts to match Grouped Query Attention ratios."""
         if n_rep == 1:
             return x
         bsz, num_kv_heads, seq_len, head_dim = x.shape
@@ -505,6 +546,7 @@ class HumanVAttention(nn.Module):
         )
 
     def _apply_partial_rope(self, q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        """Applies rotary position embeddings optionally only on a fraction of attention channels."""
         f = self.rope_partial_rotary_factor
         if f >= 0.999999:
             return _apply_rotary(q, k, cos, sin)
@@ -528,6 +570,7 @@ class HumanVAttention(nn.Module):
         v: torch.Tensor,
         attention_mask_4d: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        """Executes Scaled Dot-Product Attention (SDPA) using fused kernel paths."""
         dropout_p = self.attention_dropout if self.training else 0.0
 
         if attention_mask_4d is None:
@@ -547,6 +590,7 @@ class HumanVAttention(nn.Module):
         v: torch.Tensor,
         attention_mask_4d: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        """Standard, un-fused dense attention execution fallback pathway."""
         k = self._repeat_kv(k, self.num_kv_groups)
         v = self._repeat_kv(v, self.num_kv_groups)
 
@@ -652,6 +696,7 @@ class HumanVAttention(nn.Module):
 # Decoder Layer
 # -----------------------------------------------------------------------------
 class HumanVDecoderLayer(nn.Module):
+    """Transformer decoder block encapsulating attention, MLP/MoE layers, and residual connections."""
     def __init__(self, config: HumanVConfig, layer_idx: int):
         super().__init__()
         layer_types = getattr(config, "layer_types", None)
@@ -730,6 +775,7 @@ class HumanVDecoderLayer(nn.Module):
 # HF Base PreTrained Model
 # -----------------------------------------------------------------------------
 class HumanVPreTrainedModel(PreTrainedModel):
+    """Pretrained model class configuration template mapping model configurations."""
     config_class = HumanVConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -752,6 +798,7 @@ class HumanVPreTrainedModel(PreTrainedModel):
 # HumanVModel
 # -----------------------------------------------------------------------------
 class HumanVModel(HumanVPreTrainedModel):
+    """Transformer decoder stack that forwards embeddings and processes sequential hidden states."""
     def __init__(self, config: HumanVConfig):
         super().__init__(config)
 
@@ -880,6 +927,7 @@ class HumanVModel(HumanVPreTrainedModel):
         hidden_states = inputs_embeds
         all_hidden_states = [] if output_hidden_states else None
 
+        # Inline auxiliary loss allocation to minimize memory footprints
         total_aux_loss = torch.tensor(0.0, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
         num_experts = int(getattr(self.config, "num_experts", 8))
         top_k = int(getattr(self.config, "num_experts_per_tok", 2))
@@ -939,6 +987,7 @@ class HumanVModel(HumanVPreTrainedModel):
 # HumanVForCausalLM
 # -----------------------------------------------------------------------------
 class HumanVForCausalLM(HumanVPreTrainedModel, GenerationMixin):
+    """Causal language model class wrapper wrapping standard generation helper interfaces."""
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: HumanVConfig):
