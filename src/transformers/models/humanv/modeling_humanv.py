@@ -152,7 +152,9 @@ class HumanVPagedCache(Cache):
     Guarantees fixed physical shapes during execution to prevent TorchInductor recompilations.
     """
     def __init__(self, config: HumanVConfig, max_batch_size: int, num_pages: int, page_size: int, device: torch.device, dtype: torch.dtype = torch.bfloat16):
-        super().__init__()
+        # Satisfy Transformers 5.0+ parent validation by passing a dummy class to replicate (Bottleneck 8)
+        super().__init__(layer_class_to_replicate=object)
+        
         self.num_pages = num_pages
         self.page_size = page_size
         self.max_batch_size = max_batch_size
@@ -634,6 +636,7 @@ class HumanVAttention(nn.Module):
                 logger.warning_once(f"FlexAttention compilation fell back to Dense GQA. Reason: {e}")
                 attn_out = self._grouped_dense_attention(q, k, v, attention_mask_4d)
         else:
+            # CPU or Non-Triton GPUs fall back to highly optimized dense 4D attention
             if use_sparse:
                 attn_out = self._grouped_dense_attention(q, k, v, attention_mask_4d)
             else:
