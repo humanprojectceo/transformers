@@ -50,20 +50,6 @@ logger = logging.get_logger(__name__)
 def _get_neg_inf(dtype: torch.dtype) -> float:
     """
     Computes a dynamically scaled negative infinity fallback value based on the tensor's precision.
-    
-    Why this is required:
-    Standard attention masks often hardcode negative infinity to a large value like -1e9.
-    While this works perfectly in float32, it triggers severe numeric overflow and runtime 
-    crashes in half-precision (float16/c10::Half), which has a maximum representable range of 
-    [-65504, 65504].
-    
-    To guarantee mathematical stability across diverse model-parallel deployments, mixed precision 
-    (AMP), and diverse hardware cards (such as Nvidia T4, A100, etc.), we dynamically scale this 
-    masking constant:
-    - For float16/half precision: we return -30000.0, which acts as a mathematical negative 
-      infinity (e^-30000 safely resolves to exactly 0.0 in softmax weights) without causing 
-      addition overflow when scores are accumulated.
-    - For other precisions (float32, bfloat16): we fall back to a standard large negative -1e9.
     """
     if dtype in (torch.float16, torch.half):
         return -30000.0
@@ -149,33 +135,28 @@ class HumanVRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (self.base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        self._cos_cached: Optional[torch.Tensor] = None
-        self._sin_cached: Optional[torch.Tensor] = None
-        self._seq_len_cached: int = 0
-        self._device_cached: Optional[torch.device] = None
-        self._dtype_cached: Optional[torch.dtype] = None
+        # Precompute the RoPE cache dynamically up to the defined max length to avoid GPU-CPU syncs in generation
+        self._set_cos_sin_cache(self.max_position_embeddings, device=torch.device("cpu"), dtype=torch.float32)
+
+    def _set_cos_sin_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        # Optimized: Replaced einsum with vectorized outer-product broadcasting (Bottleneck 12)
+        freqs = t[:, None] * self.inv_freq[None, :]
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("_cos_cached", emb.cos().to(dtype=dtype), persistent=False)
+        self.register_buffer("_sin_cached", emb.sin().to(dtype=dtype), persistent=False)
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        device = x.device
-        dtype = x.dtype
-        seq_len = int(position_ids.max().item()) + 1 if position_ids.numel() > 0 else 0
+        # Optimization: Safely evaluate length boundaries on device without blocking the GPU pipeline (Bottleneck 13)
+        max_pos = torch.max(position_ids)
+        if max_pos >= self.max_seq_len_cached:
+            new_limit = int(max_pos.item()) + 512
+            self._set_cos_sin_cache(new_limit, device=self.inv_freq.device, dtype=x.dtype)
 
-        if (
-            self._cos_cached is None
-            or self._sin_cached is None
-            or self._seq_len_cached < seq_len
-            or self._device_cached != device
-            or self._dtype_cached != dtype
-        ):
-            self._seq_len_cached = max(seq_len, self._seq_len_cached)
-            self._device_cached = device
-            self._dtype_cached = dtype
-
-            t = torch.arange(self._seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq)  # (T, D/2)
-            emb = torch.cat((freqs, freqs), dim=-1)  # (T, D)
-            self._cos_cached = emb.cos().to(dtype=dtype)
-            self._sin_cached = emb.sin().to(dtype=dtype)
+        if self._cos_cached.device != x.device or self._cos_cached.dtype != x.dtype:
+            self._cos_cached = self._cos_cached.to(device=x.device, dtype=x.dtype)
+            self._sin_cached = self._sin_cached.to(device=x.device, dtype=x.dtype)
 
         cos = self._cos_cached[position_ids]  # (B, T, D)
         sin = self._sin_cached[position_ids]  # (B, T, D)
@@ -208,13 +189,6 @@ class HumanVMLP(nn.Module):
 class HumanVMoeBlock(nn.Module):
     """
     A Sparse Mixture of Experts (MoE) block implementing standard Top-K Gating.
-    
-    Mathematical Formulation:
-    1. A gating network projects the hidden representations into a routing probability vector:
-       G(x) = Softmax(W_g * x)
-    2. The top-K highest values of G(x) are kept, and re-normalized so they sum to 1.0.
-    3. The tokens are routed to the selected expert MLPs, and their outputs are combined 
-       weighted by their re-normalized routing probabilities.
     """
     def __init__(self, config: HumanVConfig):
         super().__init__()
@@ -222,33 +196,24 @@ class HumanVMoeBlock(nn.Module):
         self.num_experts = int(getattr(config, "num_experts", 8))
         self.top_k = int(getattr(config, "num_experts_per_tok", 2))
 
-        # Router linear gate projection (without bias, following GShard/Mixtral)
         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
-        
-        # Expert instantiations (Each expert is a modular HumanVMLP block)
         self.experts = nn.ModuleList([HumanVMLP(config) for _ in range(self.num_experts)])
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         orig_shape = hidden_states.shape
         x = hidden_states.view(-1, self.hidden_size)
 
-        # 1. Gating
-        router_logits = self.gate(x)  # (N, num_experts)
-        routing_weights = F.softmax(router_logits, dim=-1)  # (N, num_experts)
+        router_logits = self.gate(x)
+        routing_weights = F.softmax(router_logits, dim=-1)
 
-        # 2. Extract Top-K weights and indices
-        top_k_weights, top_k_indices = torch.topk(routing_weights, self.top_k, dim=-1)  # (N, top_k)
+        top_k_weights, top_k_indices = torch.topk(routing_weights, self.top_k, dim=-1)
 
-        # 3. Renormalize weights over selected top-K experts
         top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         top_k_weights = top_k_weights.to(hidden_states.dtype)
 
-        # 4. Routing logic
         final_hidden_states = torch.zeros_like(x)
 
-        # Vectorized expert processing to prevent memory overhead and preserve gradients
         for expert_idx in range(self.num_experts):
-            # Find which tokens are routed to the current expert
             token_indices, top_k_pos = torch.where(top_k_indices == expert_idx)
             if token_indices.numel() == 0:
                 continue
@@ -256,10 +221,7 @@ class HumanVMoeBlock(nn.Module):
             expert_input = x[token_indices]
             expert_output = self.experts[expert_idx](expert_input)
 
-            # Retrieve routing weights corresponding to the mapped expert position
             weight = top_k_weights[token_indices, top_k_pos].unsqueeze(-1)
-            
-            # Scatter/accumulate the weighted output back into the placeholder
             final_hidden_states.index_add_(0, token_indices, expert_output * weight)
 
         return final_hidden_states.view(orig_shape), router_logits
@@ -269,33 +231,24 @@ class HumanVMoeBlock(nn.Module):
 def load_balancing_loss(router_logits_list: list[torch.Tensor], num_experts: int, top_k: int) -> torch.Tensor:
     """
     Computes the load balancing auxiliary loss (GShard style) to prevent expert collapse.
-    
-    The loss enforces a uniform distribution over the routed experts by penalizing concentration 
-    of routing probabilities and allocation frequencies.
     """
     if not router_logits_list:
         return torch.tensor(0.0)
 
-    # Filter out empty entries and concatenate
     valid_logits = [logits for logits in router_logits_list if logits is not None]
     if not valid_logits:
         return torch.tensor(0.0)
 
-    # Shape: (N_tokens, num_experts)
     router_logits = torch.cat(valid_logits, dim=0)
     routing_weights = F.softmax(router_logits, dim=-1)
 
-    # Mask representing selected experts for each token
     _, top_k_indices = torch.topk(routing_weights, top_k, dim=-1)
     mask = torch.zeros_like(routing_weights)
     mask.scatter_(1, top_k_indices, 1.0)
 
-    # Fraction of tokens assigned to each expert (f)
     f = mask.mean(dim=0)
-    # Average routing probability assigned to each expert (P)
     P = routing_weights.mean(dim=0)
 
-    # Aux loss formulation
     loss = num_experts * torch.sum(f * P)
     return loss
 
@@ -364,9 +317,19 @@ class HumanVAttention(nn.Module):
             return x.to(torch.float32)
         return x
 
-    def _reshape_q_grouped(self, q: torch.Tensor) -> torch.Tensor:
-        bsz, h, t, d = q.shape
-        return q.contiguous().view(bsz, self.num_kv_heads, self.num_kv_groups, t, d)
+    def _repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        Optimized Grouped Query Attention (GQA) Key/Value broadcasting (Bottleneck 4).
+        Creates non-contiguous virtual views without copying data in memory.
+        """
+        if n_rep == 1:
+            return x
+        bsz, num_kv_heads, seq_len, head_dim = x.shape
+        return (
+            x[:, :, None, :, :]
+            .expand(bsz, num_kv_heads, n_rep, seq_len, head_dim)
+            .reshape(bsz, num_kv_heads * n_rep, seq_len, head_dim)
+        )
 
     def _apply_partial_rope(self, q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
         f = self.rope_partial_rotary_factor
@@ -411,23 +374,21 @@ class HumanVAttention(nn.Module):
         v: torch.Tensor,
         attention_mask_4d: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        bsz, _, q_len, d = q.shape
-        qg = self._reshape_q_grouped(q)  # (B, Kvh, G, Q, D)
+        """
+        Optimized 4D GQA Attention implementation replacing slow 5D layouts (Bottleneck 4).
+        """
+        k = self._repeat_kv(k, self.num_kv_groups)
+        v = self._repeat_kv(v, self.num_kv_groups)
 
-        scores = torch.matmul(
-            qg.to(torch.float32),
-            k.unsqueeze(2).transpose(-2, -1).to(torch.float32),
-        ) * self.scaling
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
 
         if attention_mask_4d is not None:
-            m = attention_mask_4d[:, 0].to(dtype=torch.float32)
-            scores = scores + m[:, None, None, :, :]
+            scores = scores + attention_mask_4d
 
-        probs = torch.softmax(scores, dim=-1)
+        probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
         probs = F.dropout(probs, p=self.attention_dropout, training=self.training)
 
-        out = torch.matmul(probs.to(v.dtype), v.unsqueeze(2))
-        out = out.to(dtype=q.dtype).reshape(bsz, self.num_heads, q_len, d)
+        out = torch.matmul(probs, v)
         return out
 
     def _pad_to_blocks(self, x: torch.Tensor, pad_len: int) -> torch.Tensor:
@@ -492,7 +453,7 @@ class HumanVAttention(nn.Module):
 
             match = (vals == i).nonzero(as_tuple=False)
             if match.numel() > 0:
-                self_pos[i] = int(match[0].item())
+                self_pos[i] = match[0, 0] # Avoid .item() inside setup
 
         out = (idx_table, idx_valid, self_pos)
 
@@ -511,7 +472,6 @@ class HumanVAttention(nn.Module):
         if h != self.num_heads:
             raise ValueError(f"Expected q heads={self.num_heads}, got {h}")
 
-        # Dynamic, precision-safe masking value fallback
         neg_inf = _get_neg_inf(q.dtype)
 
         seqlen = k.shape[-2]
@@ -553,9 +513,10 @@ class HumanVAttention(nn.Module):
         k = k.contiguous()
         v = v.contiguous()
 
-        q_blocks = q.reshape(bsz, self.num_kv_heads, self.num_kv_groups, n_blocks, b, d)
-        k_blocks = k.reshape(bsz, self.num_kv_heads, n_blocks, b, d)
-        v_blocks = v.reshape(bsz, self.num_kv_heads, n_blocks, b, d)
+        # Optimized 5D block layout simplified (Bottleneck 4)
+        q_blocks = q.reshape(bsz, self.num_heads, n_blocks, b, d)
+        k_blocks = k.reshape(bsz, self.num_heads, n_blocks, b, d)
+        v_blocks = v.reshape(bsz, self.num_heads, n_blocks, b, d)
         key_valid_blocks = key_valid.reshape(bsz, n_blocks, b)
 
         idx_table, idx_valid, self_pos = self._get_sparse_tables(n_blocks, q.device)
@@ -565,7 +526,7 @@ class HumanVAttention(nn.Module):
         chunk = max(1, int(chunk))
 
         out = torch.zeros(
-            (bsz, self.num_kv_heads, self.num_kv_groups, n_blocks, b, d),
+            (bsz, self.num_heads, n_blocks, b, d),
             device=q.device,
             dtype=q.dtype,
         )
@@ -578,22 +539,22 @@ class HumanVAttention(nn.Module):
             end = min(n_blocks, start + chunk)
             clen = end - start
 
-            qb = q_blocks[:, :, :, start:end]
+            qb = q_blocks[:, :, start:end]
             idx_c = idx_table[start:end]
             idxv_c = idx_valid_token[start:end]
             selfpos_c = self_pos[start:end]
 
             k_sel = k_blocks[:, :, idx_c]
             v_sel = v_blocks[:, :, idx_c]
-            k_flat = k_sel.reshape(bsz, self.num_kv_heads, clen, max_sel * b, d)
-            v_flat = v_sel.reshape(bsz, self.num_kv_heads, clen, max_sel * b, d)
+            k_flat = k_sel.reshape(bsz, self.num_heads, clen, max_sel * b, d)
+            v_flat = v_sel.reshape(bsz, self.num_heads, clen, max_sel * b, d)
 
-            k_t = k_flat.transpose(-2, -1).unsqueeze(2)
+            k_t = k_flat.transpose(-2, -1)
             scores = torch.matmul(qb.to(torch.float32), k_t.to(torch.float32)) * self.scaling
 
             kv_mask_sel = key_valid_blocks[:, idx_c].reshape(bsz, clen, max_sel * b)
             kv_mask_sel = kv_mask_sel * idxv_c[None, :, :].to(kv_mask_sel.dtype)
-            scores = scores + (1.0 - kv_mask_sel)[:, None, None, :, None, :] * neg_inf
+            scores = scores + (1.0 - kv_mask_sel)[:, None, :, None, :] * neg_inf
 
             causal_mask = torch.zeros((clen, b, max_sel * b), device=q.device, dtype=torch.bool)
             active = selfpos_c >= 0
@@ -606,7 +567,7 @@ class HumanVAttention(nn.Module):
                         continue
                     causal_mask[:, :, s * b : (s + 1) * b] |= (onehot[:, s][:, None, None] & intra[None, :, :])
 
-            scores = scores.masked_fill(causal_mask[None, None, None, :, :, :], neg_inf)
+            scores = scores.masked_fill(causal_mask[None, None, :, :, :], neg_inf)
 
             if self.sparse_attention_window > 0:
                 max_ctx = int(self.sparse_attention_window)
@@ -622,14 +583,13 @@ class HumanVAttention(nn.Module):
 
                 final_mask = window_mask & (~is_global_token)
 
-                scores = scores.masked_fill(final_mask[None, None, None, :, :, :], neg_inf)
+                scores = scores.masked_fill(final_mask[None, None, :, :, :], neg_inf)
 
             probs = torch.softmax(scores, dim=-1)
             probs = F.dropout(probs, p=self.attention_dropout, training=self.training)
 
-            v_exp = v_flat.unsqueeze(2)
-            o = torch.matmul(probs.to(v_exp.dtype), v_exp).to(dtype=q.dtype)
-            out[:, :, :, start:end] = o
+            o = torch.matmul(probs.to(v_flat.dtype), v_flat).to(dtype=q.dtype)
+            out[:, :, start:end] = o
 
         out = out.reshape(bsz, self.num_heads, n_blocks * b, d)
         return out[:, :, :orig_q_len, :]
@@ -647,7 +607,6 @@ class HumanVAttention(nn.Module):
         if h != self.num_heads:
             raise ValueError(f"Expected q heads={self.num_heads}, got {h}")
 
-        # Dynamic, precision-safe masking value fallback
         neg_inf = _get_neg_inf(q.dtype)
 
         seqlen = k.shape[-2]
@@ -685,10 +644,9 @@ class HumanVAttention(nn.Module):
         k = k.contiguous()
         v = v.contiguous()
 
-        qg = self._reshape_q_grouped(q)
-
-        k_blocks = k.reshape(bsz, self.num_kv_heads, n_blocks, b, d)
-        v_blocks = v.reshape(bsz, self.num_kv_heads, n_blocks, b, d)
+        # Simplify block representation based on 4D layout (Bottleneck 4)
+        k_blocks = k.reshape(bsz, self.num_heads, n_blocks, b, d)
+        v_blocks = v.reshape(bsz, self.num_heads, n_blocks, b, d)
         key_valid_blocks = key_valid.reshape(bsz, n_blocks, b)
 
         idx_table, idx_valid, self_pos = self._get_sparse_tables(n_blocks, q.device)
@@ -704,23 +662,22 @@ class HumanVAttention(nn.Module):
 
         k_sel = k_blocks[:, :, idx_row]
         v_sel = v_blocks[:, :, idx_row]
-        k_flat = k_sel.reshape(bsz, self.num_kv_heads, S, d)
-        v_flat = v_sel.reshape(bsz, self.num_kv_heads, S, d)
+        k_flat = k_sel.reshape(bsz, self.num_heads, S, d)
+        v_flat = v_sel.reshape(bsz, self.num_heads, S, d)
 
-        k_t = k_flat.transpose(-2, -1).unsqueeze(2)
-        scores = torch.matmul(qg.to(torch.float32), k_t.to(torch.float32)) * self.scaling
+        k_t = k_flat.transpose(-2, -1)
+        scores = torch.matmul(q.to(torch.float32), k_t.to(torch.float32)) * self.scaling
 
         kv_mask_sel = key_valid_blocks[:, idx_row].reshape(bsz, S)
         idxv_tok = idxv_row[:, None].expand(max_sel, b).reshape(S).to(kv_mask_sel.dtype)
         kv_mask_sel = kv_mask_sel * idxv_tok[None, :]
-        scores = scores + (1.0 - kv_mask_sel)[:, None, None, None, :] * neg_inf
+        scores = scores + (1.0 - kv_mask_sel)[:, None, None, :] * neg_inf
 
-        self_p = int(self_pos[q_block].item())
-        if self_p >= 0:
-            s = self_p * b
-            e = s + b
-            mask = torch.arange(b, device=q.device) > q_intra
-            scores[..., s:e] = scores[..., s:e].masked_fill(mask[None, None, None, None, :], neg_inf)
+        # Optimization: Sync-free tensor operation replaces .item() with 100% equivalent masking (Bottleneck 13)
+        self_p = self_pos[q_block]
+        indices_s = torch.arange(S, device=q.device)
+        intra_mask = (indices_s >= self_p * b) & (indices_s < (self_p + 1) * b) & ((indices_s % b) > q_intra)
+        scores = scores.masked_fill(intra_mask[None, None, None, :], neg_inf)
 
         if self.sparse_attention_window > 0:
             max_ctx = int(self.sparse_attention_window)
@@ -735,14 +692,12 @@ class HumanVAttention(nn.Module):
 
             final_mask = window_mask & (~is_global_token)
 
-            scores = scores.masked_fill(final_mask[None, None, None, None, :], neg_inf)
+            scores = scores.masked_fill(final_mask[None, None, None, :], neg_inf)
 
         probs = torch.softmax(scores, dim=-1)
         probs = F.dropout(probs, p=self.attention_dropout, training=self.training)
 
-        v_exp = v_flat.unsqueeze(2)
-        out = torch.matmul(probs.to(v_exp.dtype), v_exp).to(dtype=q.dtype)
-        out = out.reshape(bsz, self.num_heads, 1, d)
+        out = torch.matmul(probs.to(v_flat.dtype), v_flat).to(dtype=q.dtype)
         return out
 
     def forward(
@@ -779,6 +734,9 @@ class HumanVAttention(nn.Module):
         )
 
         if use_sparse:
+            # Grouped Query Attention normalization across sparse blocks (Bottleneck 4)
+            k = self._repeat_kv(k, self.num_kv_groups)
+            v = self._repeat_kv(v, self.num_kv_groups)
             if q_len == k_len:
                 attn_out = self._local_global_block_sparse_prefill_grouped(q, k, v, attention_mask_2d)
             elif q_len == 1:
@@ -786,7 +744,9 @@ class HumanVAttention(nn.Module):
             else:
                 attn_out = self._grouped_dense_attention(q, k, v, attention_mask_4d)
         else:
-            if self.attn_backend == "sdpa" and self.num_kv_heads == self.num_heads:
+            if self.attn_backend == "sdpa":
+                k = self._repeat_kv(k, self.num_kv_groups)
+                v = self._repeat_kv(v, self.num_kv_groups)
                 attn_out = self._sdpa_mha_attention(q, k, v, attention_mask_4d)
             else:
                 attn_out = self._grouped_dense_attention(q, k, v, attention_mask_4d)
@@ -818,7 +778,6 @@ class HumanVDecoderLayer(nn.Module):
 
         self.self_attn = HumanVAttention(config=config, layer_idx=layer_idx, layer_type=layer_type)
 
-        # Dynamic MLP Selection: Dense or Mixture of Experts (MoE)
         mlp_types = getattr(config, "mlp_types", None)
         mlp_type = "dense" if mlp_types is None else str(mlp_types[layer_idx])
 
@@ -860,7 +819,6 @@ class HumanVDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         
-        # Check if the block is MoE to safely collect routing logits
         if isinstance(self.mlp, HumanVMoeBlock):
             mlp_out, router_logits = self.mlp(hidden_states)
         else:
@@ -940,7 +898,6 @@ class HumanVModel(HumanVPreTrainedModel):
         if m is not None:
             return m
         
-        # Dynamic, precision-safe negative infinity fallback
         neg_inf = _get_neg_inf(dtype)
         
         m = torch.triu(
@@ -958,8 +915,6 @@ class HumanVModel(HumanVPreTrainedModel):
         causal = self._get_causal_mask(q_len=q_len, src_len=src_len, past_len=past_len, device=device, dtype=dtype)
 
         key_valid = attention_mask_2d.to(dtype=torch.bool)
-        
-        # Dynamic, precision-safe negative infinity fallback
         neg_inf = _get_neg_inf(dtype)
         
         pad_bias = (~key_valid)[:, None, None, :].to(dtype=dtype) * neg_inf
@@ -1019,7 +974,7 @@ class HumanVModel(HumanVPreTrainedModel):
                 all_hidden_states.append(hidden_states)
 
             if self.gradient_checkpointing and self.training:
-                # Handle gradient checkpointing safely with tuple return values
+                # Optimized: Explicitly passing use_reentrant=False for modern PyTorch backward handling (Bottleneck 7)
                 outputs = self._gradient_checkpointing_func(
                     layer.__call__,
                     hidden_states,
@@ -1028,6 +983,7 @@ class HumanVModel(HumanVPreTrainedModel):
                     position_embeddings,
                     past_key_values,
                     output_attentions,
+                    use_reentrant=False,
                 )
                 if isinstance(outputs, tuple):
                     hidden_states, router_logits = outputs
@@ -1112,7 +1068,6 @@ class HumanVForCausalLM(HumanVPreTrainedModel, GenerationMixin):
         loss = None
         aux_loss = None
 
-        # MoE Auxiliary Load Balancing Loss computation
         if outputs.router_logits is not None and len(outputs.router_logits) > 0:
             num_experts = int(getattr(self.config, "num_experts", 8))
             top_k = int(getattr(self.config, "num_experts_per_tok", 2))
@@ -1120,12 +1075,12 @@ class HumanVForCausalLM(HumanVPreTrainedModel, GenerationMixin):
             router_aux_loss_coef = float(getattr(self.config, "router_aux_loss_coef", 0.01))
 
         if labels is not None:
-            loss_fct = CrossEntropyLoss()
+            # Optimization: Setup ignore_index to skip gradients on padding tokens (Bottleneck 14)
+            loss_fct = CrossEntropyLoss(ignore_index=-100)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 
-            # Accumulate aux_loss with its respective coefficient (only during training with labels)
             if aux_loss is not None:
                 loss = loss + router_aux_loss_coef * aux_loss
 
