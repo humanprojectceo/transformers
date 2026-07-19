@@ -157,7 +157,7 @@ class HumanVPagedCache(Cache):
         
         self.num_pages = num_pages
         self.page_size = page_size
-        self.max_batch_size = max_batch_size
+        self._max_batch_size = max_batch_size  # Store in private attribute to avoid property setter clash (Bottleneck 8)
         self.device = device
         self.dtype = dtype
         
@@ -180,6 +180,22 @@ class HumanVPagedCache(Cache):
         self.physical_to_logical = torch.full((max_batch_size, num_pages), -1, dtype=torch.long, device=device)
         self.seq_lengths = torch.zeros(max_batch_size, dtype=torch.long, device=device)
         self.free_pages = list(range(num_pages))
+
+    @property
+    def batch_size(self) -> int:
+        return self._max_batch_size
+
+    @property
+    def max_batch_size(self) -> int:
+        return self._max_batch_size
+
+    @property
+    def is_initialized(self) -> bool:
+        return True
+
+    @property
+    def is_compileable(self) -> bool:
+        return True
 
     def allocate_page(self, batch_idx: int, logical_page_idx: int) -> int:
         if not self.free_pages:
