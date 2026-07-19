@@ -689,20 +689,37 @@ class HumanVModel(HumanVPreTrainedModel):
             past_key_values = DynamicCache()
 
         bsz, q_len = inputs_embeds.shape[:2]
-        past_len = past_key_values.get_seq_length() if (past_key_values is not None and use_cache) else 0
 
         # Retrieve cache_position from generation kwargs (Bottleneck 8)
         cache_position = kwargs.get("cache_position", None)
 
+        # Optimization: Standard LLaMA practice for cache length evaluation (Stateless & compile-friendly)
+        if cache_position is not None:
+            past_len = cache_position[0]
+        else:
+            past_len = past_key_values.get_seq_length() if (past_key_values is not None and use_cache) else 0
+
+        # Dynamic KV length tracking matching pre-allocated static/dynamic buffers (Bottleneck 8)
+        if use_cache and past_key_values is not None:
+            max_cache_len = getattr(past_key_values, "get_max_length", lambda: -1)()
+            if max_cache_len > 0:
+                kv_seq_len = max_cache_len
+            else:
+                kv_seq_len = past_len + q_len
+        else:
+            kv_seq_len = past_len + q_len
+
         if attention_mask is None:
-            attention_mask_2d = torch.ones((bsz, past_len + q_len), device=inputs_embeds.device, dtype=torch.bool)
+            attention_mask_2d = torch.ones((bsz, kv_seq_len), device=inputs_embeds.device, dtype=torch.bool)
         else:
             if attention_mask.dim() != 2:
                 raise ValueError("attention_mask must be 2D (bsz, seq)")
+            
+            # Setup attention_mask_2d padded with False up to pre-allocated cache buffers (Bottleneck 8/2)
             attention_mask_2d = attention_mask.to(device=inputs_embeds.device, dtype=torch.bool)
-            if attention_mask_2d.shape[1] == q_len and past_len > 0:
-                pad = torch.ones((bsz, past_len), device=inputs_embeds.device, dtype=torch.bool)
-                attention_mask_2d = torch.cat([pad, attention_mask_2d], dim=-1)
+            if attention_mask_2d.shape[1] < kv_seq_len:
+                pad_len = kv_seq_len - attention_mask_2d.shape[1]
+                attention_mask_2d = F.pad(attention_mask_2d, (0, pad_len), value=False)
 
         position_ids = torch.arange(past_len, past_len + q_len, device=inputs_embeds.device, dtype=torch.long)
         position_ids = position_ids.unsqueeze(0).expand(bsz, -1)
