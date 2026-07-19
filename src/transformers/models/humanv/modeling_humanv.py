@@ -712,8 +712,9 @@ class HumanVModel(HumanVPreTrainedModel):
         past_len = past_key_values.get_seq_length() if (past_key_values is not None and use_cache) else 0
 
         # Dynamic KV length tracking matching pre-allocated static/dynamic buffers (Bottleneck 8)
-        if use_cache and past_key_values is not None:
-            # Compat: Accessing the attribute 'max_cache_len' directly supporting HF 4.45+ and v5.0 (get_max_length is removed in v5)
+        # Safeguard: Verify the cache is explicitly an active StaticCache before querying properties (Avoid May 2026/v5 empty-cache max() exceptions)
+        is_static_cache = past_key_values is not None and past_key_values.__class__.__name__ == "StaticCache"
+        if use_cache and is_static_cache:
             max_cache_len = getattr(past_key_values, "max_cache_len", -1)
             if max_cache_len is not None and max_cache_len > 0:
                 kv_seq_len = max_cache_len
