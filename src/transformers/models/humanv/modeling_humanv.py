@@ -25,46 +25,36 @@ Key fixes and features included:
 - Hardware-agnostic fallback to dense attention if FlexAttention is not supported.
 - Implemented Industrial-grade Paged KV Cache (HumanVPagedCache) compatible with FlexAttention.
 
-BUGFIX HISTORY (Phase 2):
+BUGFIX HISTORY (this revision):
 1) Fixed `HumanVPagedCache.__init__` raising
    `cannot access local variable 'torch' where it is not associated with a value`.
    Root cause: `import torch._dynamo` inside the function body implicitly declared
    `torch` as a *local* variable for the entire enclosing function scope (Python
    scoping rule: any assignment/import of a name anywhere in a function makes it
-   local for the whole function). Fixed by importing under an alias
-   (`import torch._dynamo as torch_dynamo`).
+   local for the whole function). This shadowed the module-level `torch` import
+   used earlier in `__init__` (e.g. `torch.zeros(...)`, `torch.full(...)`),
+   causing an UnboundLocalError at runtime. Fixed by importing the submodule
+   under an alias (`import torch._dynamo as torch_dynamo`) so the global `torch`
+   name is never shadowed locally.
 
 2) Fixed `HumanVPagedCache` triggering an automatic, unsafe `torch.compile(mode=
-   "reduce-overhead")` (CUDA Graphs) wrap during plain `model.generate()` calls.
-   Root cause: `HumanVPagedCache.is_compileable` reported `True`, but `update()`
-   performs data-dependent, host-synchronizing control flow in eager mode. Fixed
-   by making `is_compileable` return `False`.
-
-PHASE 3 ADDITIONS (Kernel-level acceleration, all with safe automatic fallback):
-- Item 1 & 11 (MoE expert loop / routing overhead): `HumanVMoeBlock` routing now
-  attempts to build a MegaBlocks block-sparse MoE layer (`HumanVMegablocksMoeBlock`)
-  at construction time. If the `megablocks` package is missing, fails to import,
-  fails to construct, or fails a warm-up forward validation pass, HumanV logs a
-  single warning and transparently falls back to the original, correctness-first
-  dense Python-loop implementation (`HumanVMoeBlockDense`). This guarantees the
-  model always runs, on any hardware, regardless of MegaBlocks availability.
-- Item 6 (VRAM explosion in output layer): `HumanVForCausalLM` now optionally uses
-  Liger Kernel's `LigerFusedLinearCrossEntropyLoss`, which fuses the `lm_head`
-  projection with the cross-entropy loss computation and avoids ever materializing
-  the full `[batch, seq_len, vocab_size]` logits tensor during training - this is
-  usually the single largest activation tensor in the whole model for large
-  vocabularies. Falls back to the standard dense `lm_head` + `CrossEntropyLoss`
-  path automatically if `liger-kernel` is not installed, if not training, if
-  labels are not provided, or if the fused kernel throws at runtime.
-- Item 10 (Partial RoPE allocation overhead): `_apply_partial_rope` first attempts
-  to validate and use DeepSpeed's fused Triton rotary-embedding kernel. Because
-  that kernel is part of DeepSpeed's *inference* engine internals and is not a
-  stable, versioned public API for arbitrary custom architectures, HumanV
-  performs a one-time dummy-tensor warm-up validation at layer construction time;
-  if it fails (very likely, depending on your installed DeepSpeed version), it
-  falls back to a `torch.compile`-fused native RoPE implementation, which still
-  achieves genuine kernel fusion (no extra rotate_half allocation materialized in
-  eager mode) via TorchInductor, without requiring any external dependency.
+   "reduce-overhead")` (CUDA Graphs) wrap during plain `model.generate()` calls,
+   which produced:
+       "Error: accessing tensor output of CUDAGraphs that has been overwritten
+        by a subsequent run."
+   Root cause: `HumanVPagedCache.is_compileable` reported `True`. Recent versions
+   of `transformers.GenerationMixin.generate()` specifically check
+   `past_key_values.is_compileable` and, if `True`, opportunistically compile the
+   forward pass with a CUDA-Graph-backed mode for speed. However, this cache's
+   `update()` method performs data-dependent, host-synchronizing control flow in
+   eager mode (a Python `for` loop over the batch dimension, `torch.unique(...)`,
+   and per-item `.item()` reads used for on-demand page allocation). CUDA Graphs
+   replay requires fully static control flow and does not tolerate stale/aliased
+   output buffers being reused across steps, hence the corruption error. Fixed by
+   making `is_compileable` return `False`, so `.generate()` always executes this
+   cache eagerly (correctly). Users who explicitly want compiled execution can
+   still call `torch.compile(model, ...)` themselves (this does not default to
+   CUDA Graphs unless `mode="reduce-overhead"` is explicitly requested).
 """
 
 from __future__ import annotations
@@ -94,47 +84,6 @@ from ...utils import logging, ModelOutput
 from .configuration_humanv import HumanVConfig
 
 logger = logging.get_logger(__name__)
-
-
-# -----------------------------------------------------------------------------
-# Phase 3: Optional accelerated-kernel dependencies (all fully optional).
-#
-# Each of these imports is guarded so that missing/incompatible packages never
-# crash the model - they simply disable the corresponding acceleration path and
-# HumanV transparently falls back to its pure-PyTorch Phase 1/2 implementation.
-#
-# Installation (run before importing this module, e.g. in a Colab cell):
-#   pip install -U liger-kernel
-#   pip install -U megablocks
-#   pip install -U deepspeed
-# -----------------------------------------------------------------------------
-
-# --- MegaBlocks (block-sparse MoE kernels) ----------------------------------
-try:
-    from megablocks.layers import moe as megablocks_moe
-    from megablocks.layers.arguments import Arguments as MegablocksArguments
-    HAS_MEGABLOCKS = True
-except Exception:
-    HAS_MEGABLOCKS = False
-
-# --- Liger Kernel (fused linear + cross-entropy) ----------------------------
-try:
-    from liger_kernel.transformers.fused_linear_cross_entropy import (
-        LigerFusedLinearCrossEntropyLoss,
-    )
-    HAS_LIGER = True
-except Exception:
-    HAS_LIGER = False
-
-# --- DeepSpeed (fused Triton rotary position embedding kernel) -------------
-try:
-    from deepspeed.ops.transformer.inference.triton.rotary_emb import (
-        apply_rotary_pos_emb as _deepspeed_fused_rope_fn,
-    )
-    HAS_DEEPSPEED_ROPE = True
-except Exception:
-    _deepspeed_fused_rope_fn = None
-    HAS_DEEPSPEED_ROPE = False
 
 
 # -----------------------------------------------------------------------------
@@ -273,11 +222,24 @@ class HumanVPagedCache(Cache):
 
     @property
     def is_compileable(self) -> bool:
-        # This cache's `update()` performs data-dependent, host-synchronizing control flow
-        # in eager mode (a dynamic Python `for` loop over batch, `torch.unique`, per-item
-        # `.item()` reads for on-demand page allocation). That makes it unsafe for
-        # `GenerationMixin.generate()` to automatically wrap decoding in a CUDA-Graph-backed
-        # compiled forward pass. Returning `False` keeps `.generate()` fully eager/correct.
+        # NOTE: Even though the physical buffers are pre-allocated with fixed shapes, this
+        # cache's `update()` still performs *data-dependent, host-synchronizing* control flow
+        # in eager mode (a dynamic Python `for` loop over the batch dimension, `torch.unique`,
+        # and per-item `.item()` reads used for on-demand page allocation). This makes it
+        # unsafe for `GenerationMixin.generate()` to automatically wrap the decoding step with
+        # a CUDA-Graph-backed compiled forward pass (`torch.compile(mode="reduce-overhead")`),
+        # since CUDA Graph replay requires fully static control flow and does not tolerate
+        # stale/aliased output tensors being reused across steps.
+        #
+        # When this property reports `True`, some `transformers` versions automatically enable
+        # such a compiled+CUDA-Graph forward pass inside `.generate()`, which previously caused:
+        #   "Error: accessing tensor output of CUDAGraphs that has been overwritten by a
+        #    subsequent run."
+        #
+        # Returning `False` here keeps `.generate()` calls fully eager and correct. Users who
+        # explicitly want compiled execution can still manually call
+        # `torch.compile(model, ...)` (without `mode="reduce-overhead"`), which does not rely
+        # on this flag and does not implicitly enable CUDA Graphs.
         return False
 
     def allocate_page(self, batch_idx: int, logical_page_idx: int) -> int:
@@ -458,18 +420,6 @@ def _apply_rotary(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torc
     return q, k
 
 
-# Phase 3 (item 10): Best-effort torch.compile-fused fallback for RoPE. This gives a
-# genuine kernel-fusion benefit (Inductor fuses the elementwise mul/cat/add chain into
-# fewer memory passes) with zero external dependencies, and is used whenever the
-# DeepSpeed fused Triton kernel is unavailable/incompatible (see HumanVAttention below).
-try:
-    _fused_apply_rotary_compiled = torch.compile(_apply_rotary, dynamic=True)
-    HAS_ROPE_COMPILE = True
-except Exception:
-    _fused_apply_rotary_compiled = _apply_rotary
-    HAS_ROPE_COMPILE = False
-
-
 class HumanVRotaryEmbedding(nn.Module):
     """Constructs compile-safe sinusoidal cache arrays for Rotary Position Embeddings."""
     def __init__(self, dim: int, max_position_embeddings: int, base: float = 10000.0):
@@ -528,25 +478,10 @@ class HumanVMLP(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Sparse Mixture of Experts (MoE) - Phase 3: MegaBlocks + safe dense fallback
+# Sparse Mixture of Experts (MoE)
 # -----------------------------------------------------------------------------
-class HumanVMoeBlockBase(nn.Module):
-    """Marker base class shared by all MoE block implementations (dense loop or
-    MegaBlocks-accelerated), so downstream code (e.g. `HumanVDecoderLayer`) can
-    uniformly detect "this layer is an MoE layer and returns (output, router_logits)"
-    regardless of which concrete backend was actually instantiated."""
-    pass
-
-
-class HumanVMoeBlockDense(HumanVMoeBlockBase):
-    """
-    Reference, correctness-first Sparse Mixture of Experts (MoE) block with dynamic
-    Top-K token routing, implemented as an explicit Python loop over experts.
-
-    This is the guaranteed-to-work fallback used whenever the MegaBlocks
-    block-sparse kernels (see `HumanVMegablocksMoeBlock`) are unavailable,
-    fail to initialize, or fail a warm-up validation forward pass.
-    """
+class HumanVMoeBlock(nn.Module):
+    """Sparse Mixture of Experts (MoE) block with dynamic Top-K token routing."""
     def __init__(self, config: HumanVConfig):
         super().__init__()
         self.hidden_size = int(getattr(config, "hidden_size"))
@@ -583,107 +518,6 @@ class HumanVMoeBlockDense(HumanVMoeBlockBase):
             final_hidden_states.index_add_(0, token_indices, expert_output * weight)
 
         return final_hidden_states.view(orig_shape), router_logits
-
-
-class HumanVMegablocksMoeBlock(HumanVMoeBlockBase):
-    """
-    Phase 3 (items 1 & 11): Sparse MoE block backed by NVIDIA/Databricks' MegaBlocks
-    block-sparse grouped-GEMM Triton kernels, eliminating the explicit per-expert
-    Python `for` loop and the sequential token-routing overhead of the dense
-    reference implementation.
-
-    A small, separate linear "aux_gate" is kept purely for reporting router logits
-    into HumanV's unified GShard load-balancing auxiliary loss (`load_balancing_loss`),
-    so the aux-loss formulation stays numerically comparable whether the dense or
-    MegaBlocks backend is active. This does not participate in actual expert
-    routing (which MegaBlocks handles internally); it only mirrors the routing
-    distribution for the auxiliary loss signal.
-
-    NOTE: MegaBlocks' public API has changed across versions. Construction of this
-    class is always attempted inside a broad `try/except` (see `_build_moe_block`
-    below) and is validated with a real warm-up forward pass before being accepted;
-    any failure at either stage causes an automatic fallback to `HumanVMoeBlockDense`.
-    """
-    def __init__(self, config: HumanVConfig):
-        super().__init__()
-        self.hidden_size = int(getattr(config, "hidden_size"))
-        self.num_experts = int(getattr(config, "num_experts", 8))
-        self.top_k = int(getattr(config, "num_experts_per_tok", 2))
-        intermediate_size = int(getattr(config, "intermediate_size", self.hidden_size * 4))
-        act = str(getattr(config, "hidden_act", "silu"))
-        bias = bool(getattr(config, "mlp_bias", False))
-        mlp_impl = str(getattr(config, "megablocks_mlp_impl", "sparse"))
-
-        args = MegablocksArguments(
-            hidden_size=self.hidden_size,
-            ffn_hidden_size=intermediate_size,
-            moe_num_experts=self.num_experts,
-            moe_top_k=self.top_k,
-            activation_fn=ACT2FN[act],
-            mlp_type="mlp",
-            mlp_impl=mlp_impl,
-            bias=bias,
-            return_bias=False,
-            device=torch.device("cuda"),
-        )
-        self.moe = megablocks_moe.MoE(args)
-        self.aux_gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
-
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        orig_shape = hidden_states.shape
-        x = hidden_states.view(-1, self.hidden_size)
-
-        router_logits = self.aux_gate(x)
-
-        out = self.moe(x)
-        if isinstance(out, tuple):
-            out = out[0]
-
-        return out.view(orig_shape), router_logits
-
-
-def _build_moe_block(config: HumanVConfig) -> HumanVMoeBlockBase:
-    """
-    Factory that attempts to construct the MegaBlocks-accelerated MoE block and
-    validates it with a real warm-up forward pass. On ANY failure (missing
-    package, incompatible version, missing CUDA, shape mismatch, etc.), logs a
-    single warning and falls back to the dense reference implementation.
-    """
-    use_megablocks = bool(getattr(config, "use_megablocks_moe", True))
-
-    if use_megablocks and HAS_MEGABLOCKS:
-        try:
-            if not torch.cuda.is_available():
-                raise RuntimeError("MegaBlocks requires a CUDA-capable GPU; none detected.")
-
-            block = HumanVMegablocksMoeBlock(config).to(torch.device("cuda"))
-
-            # Warm-up validation forward pass with tiny dummy input, to catch API/shape
-            # incompatibilities once at construction time rather than mid-training.
-            hidden_size = int(getattr(config, "hidden_size"))
-            with torch.no_grad():
-                dummy = torch.zeros(1, 2, hidden_size, device="cuda", dtype=torch.float32)
-                _ = block(dummy)
-
-            logger.info(
-                "HumanVMoeBlock: MegaBlocks block-sparse MoE kernels validated and enabled "
-                f"(num_experts={block.num_experts}, top_k={block.top_k})."
-            )
-            return block
-        except Exception as e:
-            logger.warning(
-                f"HumanVMoeBlock: MegaBlocks unavailable or failed validation ({e}). "
-                "Falling back to the reference dense Python-loop MoE implementation. "
-                "Install/verify with `pip install -U megablocks` if you intended to use it."
-            )
-    elif use_megablocks and not HAS_MEGABLOCKS:
-        logger.warning(
-            "HumanVMoeBlock: `megablocks` package not found; using the reference dense "
-            "Python-loop MoE implementation. Install with `pip install -U megablocks` "
-            "to enable block-sparse MoE kernels."
-        )
-
-    return HumanVMoeBlockDense(config)
 
 
 def load_balancing_loss(router_logits_list: list[torch.Tensor], num_experts: int, top_k: int) -> torch.Tensor:
@@ -751,30 +585,6 @@ class HumanVAttention(nn.Module):
 
         self.rope_partial_rotary_factor = float(getattr(config, "rope_partial_rotary_factor", 1.0))
 
-        # Phase 3 (item 10): rotary embedding kernel selection.
-        # `self._rope_fn` is the fallback (torch.compile-fused) implementation, always available.
-        self._rope_fn = _fused_apply_rotary_compiled
-        self._deepspeed_rope_ok = False
-        if HAS_DEEPSPEED_ROPE and bool(getattr(config, "use_deepspeed_fused_rope", True)):
-            try:
-                # One-time warm-up validation with dummy tensors. DeepSpeed's fused Triton
-                # rotary kernel is designed around its own inference engine's internal tensor
-                # layouts/signatures, so we defensively validate compatibility here, once,
-                # rather than risking a repeated failure inside the hot generation loop.
-                _dq = torch.zeros(1, 1, 1, self.head_dim)
-                _dk = torch.zeros(1, 1, 1, self.head_dim)
-                _dcos = torch.ones(1, 1, 1, self.head_dim)
-                _dsin = torch.zeros(1, 1, 1, self.head_dim)
-                _ = _deepspeed_fused_rope_fn(_dq, _dk, _dcos, _dsin)
-                self._deepspeed_rope_ok = True
-                logger.info(f"Layer {layer_idx}: DeepSpeed fused RoPE kernel validated successfully.")
-            except Exception as e:
-                logger.warning(
-                    f"Layer {layer_idx}: DeepSpeed fused RoPE unavailable/incompatible ({e}). "
-                    "Falling back to torch.compile-fused native RoPE."
-                )
-                self._deepspeed_rope_ok = False
-
         self.use_sparse_attention = bool(getattr(config, "use_sparse_attention", False))
         self.sparse_attention_impl = str(getattr(config, "sparse_attention_impl", "local_global_block"))
         self.sparse_block_size = int(getattr(config, "sparse_block_size", 64))
@@ -827,18 +637,7 @@ class HumanVAttention(nn.Module):
         """Applies rotary position embeddings optionally only on a fraction of attention channels."""
         f = self.rope_partial_rotary_factor
         if f >= 0.999999:
-            if self._deepspeed_rope_ok:
-                try:
-                    return _deepspeed_fused_rope_fn(q, k, cos.unsqueeze(1), sin.unsqueeze(1))
-                except Exception as e:
-                    # Disable permanently for this layer instance after the first real
-                    # runtime failure, to avoid repeated failing attempts during generation.
-                    logger.warning_once(
-                        f"DeepSpeed fused RoPE failed at runtime ({e}); disabling for the "
-                        "remainder of this run and using the torch.compile-fused fallback."
-                    )
-                    self._deepspeed_rope_ok = False
-            return self._rope_fn(q, k, cos, sin)
+            return _apply_rotary(q, k, cos, sin)
 
         rotary_dim = int(self.head_dim * f)
         if rotary_dim <= 0:
@@ -847,9 +646,7 @@ class HumanVAttention(nn.Module):
         q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
         k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
 
-        # Note: DeepSpeed's fused kernel targets full-head rotation; partial RoPE always
-        # uses the torch.compile-fused (or plain) native fallback path.
-        q_rot, k_rot = self._rope_fn(q_rot, k_rot, cos[..., :rotary_dim], sin[..., :rotary_dim])
+        q_rot, k_rot = _apply_rotary(q_rot, k_rot, cos[..., :rotary_dim], sin[..., :rotary_dim])
         q = torch.cat([q_rot, q_pass], dim=-1)
         k = torch.cat([k_rot, k_pass], dim=-1)
         return q, k
@@ -1016,9 +813,7 @@ class HumanVDecoderLayer(nn.Module):
         mlp_type = "dense" if mlp_types is None else str(mlp_types[layer_idx])
 
         if mlp_type == "moe":
-            # Phase 3 (items 1 & 11): attempts MegaBlocks-accelerated MoE, with
-            # automatic, validated fallback to the dense reference implementation.
-            self.mlp = _build_moe_block(config)
+            self.mlp = HumanVMoeBlock(config)
         else:
             self.mlp = HumanVMLP(config)
 
@@ -1057,7 +852,7 @@ class HumanVDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         
-        if isinstance(self.mlp, HumanVMoeBlockBase):
+        if isinstance(self.mlp, HumanVMoeBlock):
             mlp_out, router_logits = self.mlp(hidden_states)
         else:
             mlp_out = self.mlp(hidden_states)
@@ -1294,28 +1089,6 @@ class HumanVForCausalLM(HumanVPreTrainedModel, GenerationMixin):
         self.model = HumanVModel(config)
         self.vocab_size = int(config.vocab_size)
         self.lm_head = nn.Linear(int(getattr(config, "hidden_size")), int(config.vocab_size), bias=False)
-
-        # Phase 3 (item 6): optional Liger fused linear + cross-entropy loss.
-        # This fuses the lm_head projection with the CE loss computation, avoiding
-        # materialization of the full [B, T, V] logits tensor during training.
-        want_liger = bool(getattr(config, "use_liger_kernel", True))
-        self._use_liger = want_liger and HAS_LIGER
-        if self._use_liger:
-            self._liger_fused_ce = LigerFusedLinearCrossEntropyLoss(ignore_index=-100)
-            logger.info(
-                "HumanVForCausalLM: Liger fused linear cross-entropy kernel enabled for "
-                "training loss computation (reduces peak VRAM usage significantly for "
-                "large vocabularies)."
-            )
-        else:
-            self._liger_fused_ce = None
-            if want_liger and not HAS_LIGER:
-                logger.warning(
-                    "HumanVForCausalLM: `liger-kernel` package not found; falling back to "
-                    "standard dense lm_head + CrossEntropyLoss. Install with "
-                    "`pip install -U liger-kernel` to reduce peak VRAM usage during training."
-                )
-
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1365,54 +1138,20 @@ class HumanVForCausalLM(HumanVPreTrainedModel, GenerationMixin):
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        aux_loss = outputs.aux_loss
+        logits = self.lm_head(hidden_states).to(torch.float32)
 
         loss = None
-        logits = None
+        aux_loss = outputs.aux_loss
 
-        # Phase 3 (item 6): try the Liger fused linear+CE path first when training
-        # with labels on CUDA, to avoid ever materializing the full vocab logits.
-        use_fused_path = (
-            self._use_liger
-            and labels is not None
-            and self.training
-            and hidden_states.is_cuda
-        )
+        if labels is not None:
+            loss_fct = CrossEntropyLoss(ignore_index=-100)
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 
-        if use_fused_path:
-            shift_hidden_states = hidden_states[..., :-1, :].contiguous().view(-1, hidden_states.size(-1))
-            shift_labels = labels[..., 1:].contiguous().view(-1)
-            try:
-                loss = self._liger_fused_ce(
-                    self.lm_head.weight,
-                    shift_hidden_states,
-                    shift_labels,
-                    self.lm_head.bias,
-                )
-                # Intentionally left as None: the fused kernel computes the loss directly
-                # from hidden states without building the full [B, T, V] logits tensor,
-                # preserving the VRAM savings that motivated this optimization. Full
-                # logits are always computed normally during evaluation/generation below.
-                logits = None
-            except Exception as e:
-                logger.warning_once(
-                    f"Liger fused linear cross-entropy failed at runtime ({e}); "
-                    "falling back to the standard dense lm_head + CrossEntropyLoss path "
-                    "for this step."
-                )
-                use_fused_path = False
-
-        if not use_fused_path:
-            logits = self.lm_head(hidden_states).to(torch.float32)
-            if labels is not None:
-                loss_fct = CrossEntropyLoss(ignore_index=-100)
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
-
-        if loss is not None and aux_loss is not None:
-            router_aux_loss_coef = float(getattr(self.config, "router_aux_loss_coef", 0.01))
-            loss = loss + router_aux_loss_coef * aux_loss
+            if aux_loss is not None:
+                router_aux_loss_coef = float(getattr(self.config, "router_aux_loss_coef", 0.01))
+                loss = loss + router_aux_loss_coef * aux_loss
 
         return HumanVCausalLMOutputWithPast(
             loss=loss,
@@ -1446,12 +1185,4 @@ class HumanVForCausalLM(HumanVPreTrainedModel, GenerationMixin):
         }
 
 
-__all__ = [
-    "HumanVForCausalLM",
-    "HumanVModel",
-    "HumanVPreTrainedModel",
-    "HumanVPagedCache",
-    "HumanVMoeBlockBase",
-    "HumanVMoeBlockDense",
-    "HumanVMegablocksMoeBlock",
-]
+__all__ = ["HumanVForCausalLM", "HumanVModel", "HumanVPreTrainedModel", "HumanVPagedCache"]
