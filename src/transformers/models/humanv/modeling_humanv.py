@@ -16,22 +16,27 @@
 
 Key fixes and features included:
 - Correct mask/dtype handling for SDPA/bfloat16.
-- Sparse prefill supports short prompts: pads Q/K/V to block multiple, then slices output back.
-- Sparse decode (q_len=1) uses original (unpadded) sequence length for q_pos.
 - Prevents caching inference-mode tensors in sparse lookup caches.
 - Dynamic Sparse MoE routing (Top-K) and flexible hybrid Dense/MoE architecture.
 - Load balancing auxiliary loss to prevent expert collapse during training.
+- Integrated PyTorch FlexAttention for custom sliding window attention masks.
+- Enabled compatibility with HF StaticCache and graph-friendly compilation (no dict caches).
+- Optimized VRAM retention via Inline Allocation of Auxiliary Losses.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional, Tuple, List, Union
 
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
+
+# PyTorch FlexAttention imports (PyTorch 2.5+)
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -57,6 +62,43 @@ def _get_neg_inf(dtype: torch.dtype) -> float:
 
 
 # -----------------------------------------------------------------------------
+# PyTorch FlexAttention Logical Mask Formulation (Bottleneck 2)
+# -----------------------------------------------------------------------------
+def _sparse_mask_fn(
+    b: torch.Tensor,
+    h: torch.Tensor,
+    q_idx: torch.Tensor,
+    kv_idx: torch.Tensor,
+    block_size: int,
+    local_blocks: int,
+    global_blocks: int,
+    window_size: int,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Logical function defining the local-global block sparse attention pattern.
+    Compiles down into a highly efficient, single-fused Triton kernel.
+    """
+    is_causal = q_idx >= kv_idx
+    q_block = q_idx // block_size
+    kv_block = kv_idx // block_size
+
+    is_global = kv_block < global_blocks
+    is_local = (kv_block <= q_block) & (kv_block >= q_block - local_blocks + 1)
+    valid = is_causal & (is_global | is_local)
+
+    if window_size > 0:
+        within_window = (q_idx - kv_idx) < window_size
+        valid = valid & (within_window | is_global)
+
+    if padding_mask is not None:
+        # Check active non-padded tokens in batch element b at key position kv_idx
+        return valid & padding_mask[b, kv_idx]
+
+    return valid
+
+
+# -----------------------------------------------------------------------------
 # Custom Output Classes for MoE Support
 # -----------------------------------------------------------------------------
 @dataclass
@@ -66,6 +108,7 @@ class HumanVBaseModelOutputWithPast(ModelOutput):
     hidden_states: Optional[Tuple[torch.Tensor, ...]] = None
     attentions: Optional[Tuple[torch.Tensor, ...]] = None
     router_logits: Optional[Tuple[torch.Tensor, ...]] = None
+    aux_loss: Optional[torch.Tensor] = None  # Inline allocated aux loss
 
 
 @dataclass
@@ -135,20 +178,17 @@ class HumanVRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (self.base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        # Precompute the RoPE cache dynamically up to the defined max length to avoid GPU-CPU syncs in generation
         self._set_cos_sin_cache(self.max_position_embeddings, device=torch.device("cpu"), dtype=torch.float32)
 
     def _set_cos_sin_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
         self.max_seq_len_cached = seq_len
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-        # Optimized: Replaced einsum with vectorized outer-product broadcasting (Bottleneck 12)
         freqs = t[:, None] * self.inv_freq[None, :]
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("_cos_cached", emb.cos().to(dtype=dtype), persistent=False)
         self.register_buffer("_sin_cached", emb.sin().to(dtype=dtype), persistent=False)
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Optimization: Safely evaluate length boundaries on device without blocking the GPU pipeline (Bottleneck 13)
         max_pos = torch.max(position_ids)
         if max_pos >= self.max_seq_len_cached:
             new_limit = int(max_pos.item()) + 512
@@ -187,9 +227,6 @@ class HumanVMLP(nn.Module):
 # Sparse MoE Block
 # -----------------------------------------------------------------------------
 class HumanVMoeBlock(nn.Module):
-    """
-    A Sparse Mixture of Experts (MoE) block implementing standard Top-K Gating.
-    """
     def __init__(self, config: HumanVConfig):
         super().__init__()
         self.hidden_size = int(getattr(config, "hidden_size"))
@@ -254,7 +291,7 @@ def load_balancing_loss(router_logits_list: list[torch.Tensor], num_experts: int
 
 
 # -----------------------------------------------------------------------------
-# Attention (Dense + Sparse local/global block)
+# Attention (Dense + Sparse local/global block via FlexAttention)
 # -----------------------------------------------------------------------------
 class HumanVAttention(nn.Module):
     def __init__(self, config: HumanVConfig, layer_idx: int, layer_type: str):
@@ -293,7 +330,6 @@ class HumanVAttention(nn.Module):
         self.use_sparse_attention = bool(getattr(config, "use_sparse_attention", False))
         self.sparse_attention_impl = str(getattr(config, "sparse_attention_impl", "local_global_block"))
         self.sparse_block_size = int(getattr(config, "sparse_block_size", 64))
-        self.sparse_prefill_chunk_blocks = int(getattr(config, "sparse_prefill_chunk_blocks", 0) or 0)
         self.sparse_local_num_blocks = int(getattr(config, "sparse_local_num_blocks", 8))
         self.sparse_global_num_blocks = int(getattr(config, "sparse_global_num_blocks", 1))
         self.sparse_attention_window = int(getattr(config, "sparse_attention_window", 0) or 0)
@@ -303,8 +339,7 @@ class HumanVAttention(nn.Module):
         if self.attn_backend not in ("gqa_matmul", "sdpa"):
             self.attn_backend = "gqa_matmul"
 
-        self._sparse_tables_cache = {}
-        self._intra_causal_cache = {}
+        # Deleted: dict-based mask/table caching to prevent compile-time graph breaks (Bottleneck 5)
 
     def _kv_dtype(self, x: torch.Tensor) -> torch.Tensor:
         if self.kv_cache_dtype == "auto":
@@ -318,10 +353,6 @@ class HumanVAttention(nn.Module):
         return x
 
     def _repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
-        """
-        Optimized Grouped Query Attention (GQA) Key/Value broadcasting (Bottleneck 4).
-        Creates non-contiguous virtual views without copying data in memory.
-        """
         if n_rep == 1:
             return x
         bsz, num_kv_heads, seq_len, head_dim = x.shape
@@ -374,9 +405,6 @@ class HumanVAttention(nn.Module):
         v: torch.Tensor,
         attention_mask_4d: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """
-        Optimized 4D GQA Attention implementation replacing slow 5D layouts (Bottleneck 4).
-        """
         k = self._repeat_kv(k, self.num_kv_groups)
         v = self._repeat_kv(v, self.num_kv_groups)
 
@@ -391,315 +419,6 @@ class HumanVAttention(nn.Module):
         out = torch.matmul(probs, v)
         return out
 
-    def _pad_to_blocks(self, x: torch.Tensor, pad_len: int) -> torch.Tensor:
-        if pad_len <= 0:
-            return x
-        pad = torch.zeros((*x.shape[:-2], pad_len, x.shape[-1]), device=x.device, dtype=x.dtype)
-        return torch.cat([x, pad], dim=-2)
-
-    def _pad_mask_to_blocks(self, mask: torch.Tensor, pad_len: int) -> torch.Tensor:
-        if pad_len <= 0:
-            return mask
-        pad = torch.zeros((mask.shape[0], pad_len), device=mask.device, dtype=mask.dtype)
-        return torch.cat([mask, pad], dim=-1)
-
-    def _get_intra_causal(self, block_size: int, device: torch.device) -> torch.Tensor:
-        key = (block_size, device)
-        m = self._intra_causal_cache.get(key)
-        if m is not None:
-            return m
-
-        i = torch.arange(block_size, device=device)
-        j = torch.arange(block_size, device=device)
-        intra = j[None, :] > i[:, None]
-
-        if not torch.is_inference_mode_enabled():
-            self._intra_causal_cache[key] = intra
-        return intra
-
-    def _get_sparse_tables(self, n_blocks: int, device: torch.device):
-        key = (n_blocks, device)
-        cached = self._sparse_tables_cache.get(key)
-        if cached is not None:
-            return cached
-
-        local_k = max(1, int(self.sparse_local_num_blocks))
-        glob_k = max(0, int(self.sparse_global_num_blocks))
-
-        max_sel = local_k + glob_k
-        idx_table = torch.zeros((n_blocks, max_sel), dtype=torch.long, device=device)
-        idx_valid = torch.zeros((n_blocks, max_sel), dtype=torch.bool, device=device)
-        self_pos = torch.full((n_blocks,), -1, dtype=torch.long, device=device)
-
-        for i in range(n_blocks):
-            sel = []
-            for g in range(glob_k):
-                if g < n_blocks:
-                    sel.append(g)
-            start = max(0, i - (local_k - 1))
-            for b in range(start, i + 1):
-                sel.append(b)
-
-            seen = set()
-            li = []
-            for x in sel:
-                if x not in seen:
-                    li.append(x)
-                    seen.add(x)
-
-            vals = torch.tensor(li, dtype=torch.long, device=device)
-            idx_table[i, : vals.numel()] = vals
-            idx_valid[i, : vals.numel()] = True
-
-            match = (vals == i).nonzero(as_tuple=False)
-            if match.numel() > 0:
-                self_pos[i] = match[0, 0] # Avoid .item() inside setup
-
-        out = (idx_table, idx_valid, self_pos)
-
-        if not torch.is_inference_mode_enabled():
-            self._sparse_tables_cache[key] = out
-        return out
-
-    def _local_global_block_sparse_prefill_grouped(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        attention_mask_2d: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        bsz, h, q_len, d = q.shape
-        if h != self.num_heads:
-            raise ValueError(f"Expected q heads={self.num_heads}, got {h}")
-
-        neg_inf = _get_neg_inf(q.dtype)
-
-        seqlen = k.shape[-2]
-        orig_q_len = q_len
-        orig_seqlen = seqlen
-
-        b = self.sparse_block_size
-        if b <= 0:
-            raise ValueError("sparse_block_size must be > 0")
-
-        n_blocks = (seqlen + b - 1) // b
-        pad_len = n_blocks * b - seqlen
-        if pad_len > 0:
-            k = self._pad_to_blocks(k, pad_len)
-            v = self._pad_to_blocks(v, pad_len)
-            q = self._pad_to_blocks(q, pad_len)
-            if attention_mask_2d is not None:
-                attention_mask_2d = self._pad_mask_to_blocks(attention_mask_2d, pad_len)
-            seqlen = n_blocks * b
-            q_len = n_blocks * b
-
-        if attention_mask_2d is None:
-            if pad_len > 0:
-                key_valid = torch.cat(
-                    [
-                        torch.ones((bsz, orig_seqlen), device=q.device, dtype=torch.float32),
-                        torch.zeros((bsz, seqlen - orig_seqlen), device=q.device, dtype=torch.float32),
-                    ],
-                    dim=-1,
-                )
-            else:
-                key_valid = torch.ones((bsz, seqlen), device=q.device, dtype=torch.float32)
-        else:
-            key_valid = attention_mask_2d.to(device=q.device, dtype=torch.float32)
-            if key_valid.shape[1] != seqlen:
-                raise ValueError(f"attention_mask_2d wrong length: {key_valid.shape[1]} vs {seqlen}")
-
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-
-        # Optimized 5D block layout simplified (Bottleneck 4)
-        q_blocks = q.reshape(bsz, self.num_heads, n_blocks, b, d)
-        k_blocks = k.reshape(bsz, self.num_heads, n_blocks, b, d)
-        v_blocks = v.reshape(bsz, self.num_heads, n_blocks, b, d)
-        key_valid_blocks = key_valid.reshape(bsz, n_blocks, b)
-
-        idx_table, idx_valid, self_pos = self._get_sparse_tables(n_blocks, q.device)
-        intra = self._get_intra_causal(b, q.device)
-
-        chunk = self.sparse_prefill_chunk_blocks if self.sparse_prefill_chunk_blocks > 0 else n_blocks
-        chunk = max(1, int(chunk))
-
-        out = torch.zeros(
-            (bsz, self.num_heads, n_blocks, b, d),
-            device=q.device,
-            dtype=q.dtype,
-        )
-
-        max_sel = idx_table.shape[1]
-        offsets = torch.arange(b, device=q.device).repeat(max_sel)
-        idx_valid_token = idx_valid[..., None].expand(n_blocks, max_sel, b).reshape(n_blocks, max_sel * b)
-
-        for start in range(0, n_blocks, chunk):
-            end = min(n_blocks, start + chunk)
-            clen = end - start
-
-            qb = q_blocks[:, :, start:end]
-            idx_c = idx_table[start:end]
-            idxv_c = idx_valid_token[start:end]
-            selfpos_c = self_pos[start:end]
-
-            k_sel = k_blocks[:, :, idx_c]
-            v_sel = v_blocks[:, :, idx_c]
-            k_flat = k_sel.reshape(bsz, self.num_heads, clen, max_sel * b, d)
-            v_flat = v_sel.reshape(bsz, self.num_heads, clen, max_sel * b, d)
-
-            k_t = k_flat.transpose(-2, -1)
-            scores = torch.matmul(qb.to(torch.float32), k_t.to(torch.float32)) * self.scaling
-
-            kv_mask_sel = key_valid_blocks[:, idx_c].reshape(bsz, clen, max_sel * b)
-            kv_mask_sel = kv_mask_sel * idxv_c[None, :, :].to(kv_mask_sel.dtype)
-            scores = scores + (1.0 - kv_mask_sel)[:, None, :, None, :] * neg_inf
-
-            causal_mask = torch.zeros((clen, b, max_sel * b), device=q.device, dtype=torch.bool)
-            active = selfpos_c >= 0
-            if active.any():
-                pos = torch.clamp(selfpos_c, min=0)
-                onehot = F.one_hot(pos, num_classes=max_sel).to(dtype=torch.bool)
-                onehot = onehot & active[:, None]
-                for s in range(max_sel):
-                    if not onehot[:, s].any():
-                        continue
-                    causal_mask[:, :, s * b : (s + 1) * b] |= (onehot[:, s][:, None, None] & intra[None, :, :])
-
-            scores = scores.masked_fill(causal_mask[None, None, :, :, :], neg_inf)
-
-            if self.sparse_attention_window > 0:
-                max_ctx = int(self.sparse_attention_window)
-                key_abs = idx_c.repeat_interleave(b, dim=1) * b + offsets[None, :]
-                q_block_ids = torch.arange(start, end, device=q.device)
-                q_abs = q_block_ids[:, None] * b + torch.arange(b, device=q.device)[None, :]
-                min_allowed = (q_abs[:, :, None] - (max_ctx - 1)).clamp(min=0)
-
-                window_mask = key_abs[:, None, :] < min_allowed
-
-                global_tokens_count = int(self.sparse_global_num_blocks) * b
-                is_global_token = key_abs[:, None, :] < global_tokens_count
-
-                final_mask = window_mask & (~is_global_token)
-
-                scores = scores.masked_fill(final_mask[None, None, :, :, :], neg_inf)
-
-            probs = torch.softmax(scores, dim=-1)
-            probs = F.dropout(probs, p=self.attention_dropout, training=self.training)
-
-            o = torch.matmul(probs.to(v_flat.dtype), v_flat).to(dtype=q.dtype)
-            out[:, :, start:end] = o
-
-        out = out.reshape(bsz, self.num_heads, n_blocks * b, d)
-        return out[:, :, :orig_q_len, :]
-
-    def _local_global_block_sparse_decode_one_grouped(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        attention_mask_2d: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        bsz, h, q_len, d = q.shape
-        if q_len != 1:
-            raise ValueError("decode_one expects q_len == 1")
-        if h != self.num_heads:
-            raise ValueError(f"Expected q heads={self.num_heads}, got {h}")
-
-        neg_inf = _get_neg_inf(q.dtype)
-
-        seqlen = k.shape[-2]
-        orig_seqlen = seqlen
-        b = self.sparse_block_size
-        if b <= 0:
-            raise ValueError("sparse_block_size must be > 0")
-
-        n_blocks = (seqlen + b - 1) // b
-        pad_len = n_blocks * b - seqlen
-        if pad_len > 0:
-            k = self._pad_to_blocks(k, pad_len)
-            v = self._pad_to_blocks(v, pad_len)
-            if attention_mask_2d is not None:
-                attention_mask_2d = self._pad_mask_to_blocks(attention_mask_2d, pad_len)
-            seqlen = n_blocks * b
-
-        if attention_mask_2d is None:
-            if pad_len > 0:
-                key_valid = torch.cat(
-                    [
-                        torch.ones((bsz, orig_seqlen), device=q.device, dtype=torch.float32),
-                        torch.zeros((bsz, seqlen - orig_seqlen), device=q.device, dtype=torch.float32),
-                    ],
-                    dim=-1,
-                )
-            else:
-                key_valid = torch.ones((bsz, seqlen), device=q.device, dtype=torch.float32)
-        else:
-            key_valid = attention_mask_2d.to(device=q.device, dtype=torch.float32)
-            if key_valid.shape[1] != seqlen:
-                raise ValueError(f"attention_mask_2d wrong length: {key_valid.shape[1]} vs {seqlen}")
-
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-
-        # Simplify block representation based on 4D layout (Bottleneck 4)
-        k_blocks = k.reshape(bsz, self.num_heads, n_blocks, b, d)
-        v_blocks = v.reshape(bsz, self.num_heads, n_blocks, b, d)
-        key_valid_blocks = key_valid.reshape(bsz, n_blocks, b)
-
-        idx_table, idx_valid, self_pos = self._get_sparse_tables(n_blocks, q.device)
-
-        q_pos = orig_seqlen - 1
-        q_block = q_pos // b
-        q_intra = q_pos % b
-
-        idx_row = idx_table[q_block]
-        idxv_row = idx_valid[q_block]
-        max_sel = idx_row.numel()
-        S = max_sel * b
-
-        k_sel = k_blocks[:, :, idx_row]
-        v_sel = v_blocks[:, :, idx_row]
-        k_flat = k_sel.reshape(bsz, self.num_heads, S, d)
-        v_flat = v_sel.reshape(bsz, self.num_heads, S, d)
-
-        k_t = k_flat.transpose(-2, -1)
-        scores = torch.matmul(q.to(torch.float32), k_t.to(torch.float32)) * self.scaling
-
-        kv_mask_sel = key_valid_blocks[:, idx_row].reshape(bsz, S)
-        idxv_tok = idxv_row[:, None].expand(max_sel, b).reshape(S).to(kv_mask_sel.dtype)
-        kv_mask_sel = kv_mask_sel * idxv_tok[None, :]
-        scores = scores + (1.0 - kv_mask_sel)[:, None, None, :] * neg_inf
-
-        # Optimization: Sync-free tensor operation replaces .item() with 100% equivalent masking (Bottleneck 13)
-        self_p = self_pos[q_block]
-        indices_s = torch.arange(S, device=q.device)
-        intra_mask = (indices_s >= self_p * b) & (indices_s < (self_p + 1) * b) & ((indices_s % b) > q_intra)
-        scores = scores.masked_fill(intra_mask[None, None, None, :], neg_inf)
-
-        if self.sparse_attention_window > 0:
-            max_ctx = int(self.sparse_attention_window)
-            offsets = torch.arange(b, device=q.device).repeat(max_sel)
-            key_abs = idx_row.repeat_interleave(b) * b + offsets
-            min_allowed = max(0, q_pos - (max_ctx - 1))
-
-            window_mask = key_abs < min_allowed
-
-            global_tokens_count = int(self.sparse_global_num_blocks) * b
-            is_global_token = key_abs < global_tokens_count
-
-            final_mask = window_mask & (~is_global_token)
-
-            scores = scores.masked_fill(final_mask[None, None, None, :], neg_inf)
-
-        probs = torch.softmax(scores, dim=-1)
-        probs = F.dropout(probs, p=self.attention_dropout, training=self.training)
-
-        out = torch.matmul(probs.to(v_flat.dtype), v_flat).to(dtype=q.dtype)
-        return out
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -708,6 +427,7 @@ class HumanVAttention(nn.Module):
         attention_mask_2d: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
+        cache_position: Optional[torch.Tensor] = None,  # Added for StaticCache support (Bottleneck 8)
         **kwargs,
     ):
         bsz, q_len, _ = hidden_states.shape
@@ -723,7 +443,9 @@ class HumanVAttention(nn.Module):
         if past_key_values is not None:
             k = self._kv_dtype(k)
             v = self._kv_dtype(v)
-            k, v = past_key_values.update(k, v, self.layer_idx)
+            # Pass cache_position parameters dynamically for StaticCache (Bottleneck 8)
+            cache_kwargs = {"cache_position": cache_position} if cache_position is not None else None
+            k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
 
         k_len = k.shape[-2]
 
@@ -734,15 +456,35 @@ class HumanVAttention(nn.Module):
         )
 
         if use_sparse:
-            # Grouped Query Attention normalization across sparse blocks (Bottleneck 4)
+            # 1. BroadCast KV heads to align GQA within FlexAttention
             k = self._repeat_kv(k, self.num_kv_groups)
             v = self._repeat_kv(v, self.num_kv_groups)
-            if q_len == k_len:
-                attn_out = self._local_global_block_sparse_prefill_grouped(q, k, v, attention_mask_2d)
-            elif q_len == 1:
-                attn_out = self._local_global_block_sparse_decode_one_grouped(q, k, v, attention_mask_2d)
-            else:
-                attn_out = self._grouped_dense_attention(q, k, v, attention_mask_4d)
+
+            # 2. Setup Boolean Padding mask for FlexAttention
+            pad_mask = attention_mask_2d.to(dtype=torch.bool) if attention_mask_2d is not None else None
+
+            # 3. Create logical mask on-the-fly and compile via Triton (Bottleneck 2)
+            mask_mod = partial(
+                _sparse_mask_fn,
+                block_size=self.sparse_block_size,
+                local_blocks=self.sparse_local_num_blocks,
+                global_blocks=self.sparse_global_num_blocks,
+                window_size=self.sparse_attention_window,
+                padding_mask=pad_mask,
+            )
+
+            block_mask = create_block_mask(
+                mask_mod,
+                B=bsz,
+                H=None,  # Broadcast mask across heads
+                Q_LEN=q_len,
+                KV_LEN=k_len,
+                device=q.device,
+                _compile=True,  # JIT pre-compilation
+            )
+
+            # 4. Execute fused FlexAttention
+            attn_out = flex_attention(q, k, v, block_mask=block_mask)
         else:
             if self.attn_backend == "sdpa":
                 k = self._repeat_kv(k, self.num_kv_groups)
@@ -797,6 +539,7 @@ class HumanVDecoderLayer(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
+        cache_position: Optional[torch.Tensor] = None,  # For StaticCache (Bottleneck 8)
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # 1. Self Attention
@@ -810,6 +553,7 @@ class HumanVDecoderLayer(nn.Module):
             attention_mask_2d=attention_mask_2d,
             past_key_values=past_key_values,
             output_attentions=output_attentions,
+            cache_position=cache_position,
         )
         if self.resid_dropout and self.training:
             attn_out = F.dropout(attn_out, p=self.resid_dropout, training=True)
@@ -881,7 +625,7 @@ class HumanVModel(HumanVPreTrainedModel):
             base=rope_base,
         )
 
-        self._causal_cache = {}
+        # Deleted self._causal_cache to prevent graph breaks during compile (Bottleneck 5)
         self.gradient_checkpointing = False
 
         self.post_init()
@@ -893,20 +637,13 @@ class HumanVModel(HumanVPreTrainedModel):
         self.embed_tokens = value
 
     def _get_causal_mask(self, q_len: int, src_len: int, past_len: int, device: torch.device, dtype: torch.dtype):
-        key = (q_len, src_len, past_len, device, dtype)
-        m = self._causal_cache.get(key)
-        if m is not None:
-            return m
-        
+        # Statless creation avoids python dict caching and enables full torch.compile graph matching (Bottleneck 5)
         neg_inf = _get_neg_inf(dtype)
-        
         m = torch.triu(
             torch.full((q_len, src_len), neg_inf, device=device, dtype=dtype),
             diagonal=1 + past_len,
         )
-        m = m[None, None, :, :]
-        self._causal_cache[key] = m
-        return m
+        return m[None, None, :, :]
 
     def _prepare_attention_masks(self, attention_mask_2d: torch.Tensor, q_len: int, past_len: int, dtype: torch.dtype):
         device = attention_mask_2d.device
@@ -939,7 +676,7 @@ class HumanVModel(HumanVPreTrainedModel):
         if use_cache is None:
             use_cache = bool(getattr(self.config, "use_cache", True))
 
-        # Safeguard: Forcefully disable `use_cache` during reentrant/non-reentrant checkpointed training to prevent size duplication
+        # Safeguard: Forcefully disable `use_cache` during reentrant/non-reentrant checkpointed training
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning(
@@ -953,6 +690,9 @@ class HumanVModel(HumanVPreTrainedModel):
 
         bsz, q_len = inputs_embeds.shape[:2]
         past_len = past_key_values.get_seq_length() if (past_key_values is not None and use_cache) else 0
+
+        # Retrieve cache_position from generation kwargs (Bottleneck 8)
+        cache_position = kwargs.get("cache_position", None)
 
         if attention_mask is None:
             attention_mask_2d = torch.ones((bsz, past_len + q_len), device=inputs_embeds.device, dtype=torch.bool)
@@ -976,22 +716,26 @@ class HumanVModel(HumanVPreTrainedModel):
 
         hidden_states = inputs_embeds
         all_hidden_states = [] if output_hidden_states else None
-        all_router_logits = []
+
+        # Inline auxiliary loss accumulator - instantly releases router logits memory (Bottleneck 9)
+        total_aux_loss = torch.tensor(0.0, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        num_experts = int(getattr(self.config, "num_experts", 8))
+        top_k = int(getattr(self.config, "num_experts_per_tok", 2))
 
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
 
             if self.gradient_checkpointing and self.training:
-                # Optimized: Explicitly passing use_reentrant=False for modern PyTorch backward handling (Bottleneck 7)
                 outputs = self._gradient_checkpointing_func(
                     layer.__call__,
                     hidden_states,
                     attention_mask_4d,
                     attention_mask_2d,
                     position_embeddings,
-                    past_key_values if use_cache else None, # Pass None to fully isolate states
+                    past_key_values if use_cache else None,
                     output_attentions,
+                    cache_position,
                     use_reentrant=False,
                 )
                 if isinstance(outputs, tuple):
@@ -1007,10 +751,13 @@ class HumanVModel(HumanVPreTrainedModel):
                     position_embeddings=position_embeddings,
                     past_key_values=past_key_values if use_cache else None,
                     output_attentions=output_attentions,
+                    cache_position=cache_position,
                 )
 
             if router_logits is not None:
-                all_router_logits.append(router_logits)
+                # Inline calculation: Compute load balancing loss immediately, discarding heavy router_logits (Bottleneck 9)
+                layer_aux_loss = load_balancing_loss([router_logits], num_experts, top_k)
+                total_aux_loss = total_aux_loss + layer_aux_loss
 
         hidden_states = self.norm(hidden_states)
 
@@ -1022,7 +769,8 @@ class HumanVModel(HumanVPreTrainedModel):
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=None,
-            router_logits=tuple(all_router_logits) if all_router_logits else None,
+            router_logits=None,  # Freed from memory to save VRAM
+            aux_loss=total_aux_loss,
         )
 
 
@@ -1075,22 +823,18 @@ class HumanVForCausalLM(HumanVPreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states).to(torch.float32)
 
         loss = None
-        aux_loss = None
-
-        if outputs.router_logits is not None and len(outputs.router_logits) > 0:
-            num_experts = int(getattr(self.config, "num_experts", 8))
-            top_k = int(getattr(self.config, "num_experts_per_tok", 2))
-            aux_loss = load_balancing_loss(outputs.router_logits, num_experts, top_k)
-            router_aux_loss_coef = float(getattr(self.config, "router_aux_loss_coef", 0.01))
+        # Retrieve inline-allocated auxiliary loss directly from BaseModelOutput (Bottleneck 9)
+        aux_loss = outputs.aux_loss
 
         if labels is not None:
-            # Optimization: Setup ignore_index to skip gradients on padding tokens (Bottleneck 14)
+            # Setup ignore_index to skip gradients on padding tokens (Bottleneck 14)
             loss_fct = CrossEntropyLoss(ignore_index=-100)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 
             if aux_loss is not None:
+                router_aux_loss_coef = float(getattr(self.config, "router_aux_loss_coef", 0.01))
                 loss = loss + router_aux_loss_coef * aux_loss
 
         return HumanVCausalLMOutputWithPast(
@@ -1100,7 +844,7 @@ class HumanVForCausalLM(HumanVPreTrainedModel, GenerationMixin):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=None,
-            router_logits=outputs.router_logits,
+            router_logits=None,
         )
 
     def prepare_inputs_for_generation(
@@ -1110,13 +854,20 @@ class HumanVForCausalLM(HumanVPreTrainedModel, GenerationMixin):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        # Handle dynamic tracking parameters during generation loops
+        cache_position = kwargs.get("cache_position", None)
         if past_key_values is not None:
-            input_ids = input_ids[:, -1:]
+            # Capture from cache_position if managed, or fallback to sequence indexing
+            if cache_position is not None:
+                input_ids = input_ids[:, cache_position]
+            else:
+                input_ids = input_ids[:, -1:]
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
             "attention_mask": attention_mask,
             "use_cache": kwargs.get("use_cache", True),
+            "cache_position": cache_position,
         }
 
 
