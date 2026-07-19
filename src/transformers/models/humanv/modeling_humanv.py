@@ -25,17 +25,36 @@ Key fixes and features included:
 - Hardware-agnostic fallback to dense attention if FlexAttention is not supported.
 - Implemented Industrial-grade Paged KV Cache (HumanVPagedCache) compatible with FlexAttention.
 
-BUGFIX (this revision):
-- Fixed `HumanVPagedCache.__init__` raising
-  `cannot access local variable 'torch' where it is not associated with a value`.
-  Root cause: `import torch._dynamo` inside the function body implicitly declared
-  `torch` as a *local* variable for the entire enclosing function scope (Python
-  scoping rule: any assignment/import of a name anywhere in a function makes it
-  local for the whole function). This shadowed the module-level `torch` import
-  used earlier in `__init__` (e.g. `torch.zeros(...)`, `torch.full(...)`),
-  causing an UnboundLocalError at runtime. Fixed by importing the submodule
-  under an alias (`import torch._dynamo as torch_dynamo`) so the global `torch`
-  name is never shadowed locally.
+BUGFIX HISTORY (this revision):
+1) Fixed `HumanVPagedCache.__init__` raising
+   `cannot access local variable 'torch' where it is not associated with a value`.
+   Root cause: `import torch._dynamo` inside the function body implicitly declared
+   `torch` as a *local* variable for the entire enclosing function scope (Python
+   scoping rule: any assignment/import of a name anywhere in a function makes it
+   local for the whole function). This shadowed the module-level `torch` import
+   used earlier in `__init__` (e.g. `torch.zeros(...)`, `torch.full(...)`),
+   causing an UnboundLocalError at runtime. Fixed by importing the submodule
+   under an alias (`import torch._dynamo as torch_dynamo`) so the global `torch`
+   name is never shadowed locally.
+
+2) Fixed `HumanVPagedCache` triggering an automatic, unsafe `torch.compile(mode=
+   "reduce-overhead")` (CUDA Graphs) wrap during plain `model.generate()` calls,
+   which produced:
+       "Error: accessing tensor output of CUDAGraphs that has been overwritten
+        by a subsequent run."
+   Root cause: `HumanVPagedCache.is_compileable` reported `True`. Recent versions
+   of `transformers.GenerationMixin.generate()` specifically check
+   `past_key_values.is_compileable` and, if `True`, opportunistically compile the
+   forward pass with a CUDA-Graph-backed mode for speed. However, this cache's
+   `update()` method performs data-dependent, host-synchronizing control flow in
+   eager mode (a Python `for` loop over the batch dimension, `torch.unique(...)`,
+   and per-item `.item()` reads used for on-demand page allocation). CUDA Graphs
+   replay requires fully static control flow and does not tolerate stale/aliased
+   output buffers being reused across steps, hence the corruption error. Fixed by
+   making `is_compileable` return `False`, so `.generate()` always executes this
+   cache eagerly (correctly). Users who explicitly want compiled execution can
+   still call `torch.compile(model, ...)` themselves (this does not default to
+   CUDA Graphs unless `mode="reduce-overhead"` is explicitly requested).
 """
 
 from __future__ import annotations
@@ -203,7 +222,25 @@ class HumanVPagedCache(Cache):
 
     @property
     def is_compileable(self) -> bool:
-        return True
+        # NOTE: Even though the physical buffers are pre-allocated with fixed shapes, this
+        # cache's `update()` still performs *data-dependent, host-synchronizing* control flow
+        # in eager mode (a dynamic Python `for` loop over the batch dimension, `torch.unique`,
+        # and per-item `.item()` reads used for on-demand page allocation). This makes it
+        # unsafe for `GenerationMixin.generate()` to automatically wrap the decoding step with
+        # a CUDA-Graph-backed compiled forward pass (`torch.compile(mode="reduce-overhead")`),
+        # since CUDA Graph replay requires fully static control flow and does not tolerate
+        # stale/aliased output tensors being reused across steps.
+        #
+        # When this property reports `True`, some `transformers` versions automatically enable
+        # such a compiled+CUDA-Graph forward pass inside `.generate()`, which previously caused:
+        #   "Error: accessing tensor output of CUDAGraphs that has been overwritten by a
+        #    subsequent run."
+        #
+        # Returning `False` here keeps `.generate()` calls fully eager and correct. Users who
+        # explicitly want compiled execution can still manually call
+        # `torch.compile(model, ...)` (without `mode="reduce-overhead"`), which does not rely
+        # on this flag and does not implicitly enable CUDA Graphs.
+        return False
 
     def allocate_page(self, batch_idx: int, logical_page_idx: int) -> int:
         """Allocates a free physical page to a logical sequence page index."""
